@@ -1,0 +1,28 @@
+services:
+  # ──────────────── BACKEND (FastAPI) ────────────────
+  - type: web
+    name: quantaira-backend
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn server:app --host 0.0.0.0 --port 8000
+    envVars:
+      - key: TENOVI_WEBHOOK_KEY
+        value: your_webhook_secret_here
+      - key: DATABASE_URL
+        value: sqlite:///data/tenovi.db
+    autoDeploy: true
+
+  # ──────────────── FRONTEND (Streamlit) ────────────────
+  - type: web
+    name: quantaira-dashboard
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run streamlit_app/Home.py --server.port 8501 --server.address 0.0.0.0
+    envVars:
+      - key: BACKEND_URL
+        value: https://quantaira-backend.onrender.com
+      - key: USDA_API_KEY
+        value: your_usda_api_key_here
+    autoDeploy: true

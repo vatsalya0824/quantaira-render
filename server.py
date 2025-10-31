@@ -1,8 +1,5 @@
-# server.py — Quantaira Webhook & API (Render-ready, robust dedupe)
-# FastAPI app to receive Tenovi webhooks and serve patient/vitals/meals/notes/limits.
-
-import os
-import json
+# server.py — Quantaira Webhook & API (Render-ready)
+import os, json
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Union
 
@@ -14,17 +11,11 @@ from sqlalchemy.exc import IntegrityError
 # ─────────────────────────────────────────────────────────
 # Config / DB
 # ─────────────────────────────────────────────────────────
-# Works with either SQLite (default) or Postgres on Render
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///data/tenovi.db")
 if DATABASE_URL.startswith("sqlite:///"):
     os.makedirs(os.path.dirname(DATABASE_URL.replace("sqlite:///", "")), exist_ok=True)
 
-engine = create_engine(
-    DATABASE_URL,
-    future=True,
-    pool_pre_ping=True,
-)
-
+engine = create_engine(DATABASE_URL, future=True, pool_pre_ping=True)
 TENOVI_WEBHOOK_KEY = (os.getenv("TENOVI_WEBHOOK_KEY") or "").strip()
 
 # ─────────────────────────────────────────────────────────
@@ -51,20 +42,17 @@ def norm_gateway(s: Optional[str]) -> Optional[str]:
     if not s:
         return None
     s = str(s).strip().upper()
-    # Keep only alphanumeric; drop :, -, spaces, etc.
     keep = "".join(ch for ch in s if ch.isalnum())
     return keep or None
 
-
 # ─────────────────────────────────────────────────────────
-# Schema / Init  (Postgres- & SQLite-safe)
+# Schema / Init  (Postgres & SQLite)
 # ─────────────────────────────────────────────────────────
 def init_db() -> None:
     DIALECT = engine.url.get_backend_name()
     IS_PG = DIALECT.startswith("postgres")
 
     if IS_PG:
-        # ---------- Postgres DDL ----------
         vitals_sql = """
         CREATE TABLE IF NOT EXISTS vitals (
             id BIGSERIAL PRIMARY KEY,
@@ -119,7 +107,6 @@ def init_db() -> None:
         );
         """
     else:
-        # ---------- SQLite DDL ----------
         vitals_sql = """
         CREATE TABLE IF NOT EXISTS vitals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -181,30 +168,27 @@ def init_db() -> None:
         conn.execute(text(limits_sql))
         conn.execute(text(gateway_sql))
 
-        # Backfill/normalize existing gateway_map rows safely, then dedupe
+        # Normalize + dedupe gateway_map
         rows = conn.execute(text("SELECT id, gateway_raw FROM gateway_map")).fetchall()
         for rid, raw_val in rows:
             n = norm_gateway(raw_val)
             if not n:
                 continue
             try:
-                conn.execute(
-                    text("UPDATE gateway_map SET gateway_norm=:n WHERE id=:i"),
-                    {"n": n, "i": rid}
-                )
+                conn.execute(text(
+                    "UPDATE gateway_map SET gateway_norm=:n WHERE id=:i"
+                ), {"n": n, "i": rid})
             except IntegrityError:
-                # Another row already owns this normalized key, skip update
                 pass
 
-        # One-shot dedupe: keep the lowest id per gateway_norm
         dups = conn.execute(text("""
             WITH ranked AS (
-                SELECT id, gateway_norm,
-                       ROW_NUMBER() OVER (PARTITION BY gateway_norm ORDER BY id) AS rn
-                FROM gateway_map
-                WHERE gateway_norm IS NOT NULL
+              SELECT id, gateway_norm,
+                     ROW_NUMBER() OVER (PARTITION BY gateway_norm ORDER BY id) rn
+              FROM gateway_map
+              WHERE gateway_norm IS NOT NULL
             )
-            SELECT id FROM ranked WHERE rn > 1;
+            SELECT id FROM ranked WHERE rn > 1
         """)).fetchall()
         for (dup_id,) in dups:
             conn.execute(text("DELETE FROM gateway_map WHERE id=:i"), {"i": dup_id})
@@ -212,20 +196,20 @@ def init_db() -> None:
 # ─────────────────────────────────────────────────────────
 # App
 # ─────────────────────────────────────────────────────────
-app = FastAPI(title="Quantaira Webhook & API", version="1.2.0")
+app = FastAPI(title="Quantaira Webhook & API", version="1.3.0")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
 
-# ─────────────────────────────────────────────────────────
-# Routes
-# ─────────────────────────────────────────────────────────
-# ─────────────────────────────────────────────
-# Health + Root endpoints (for Render)
-# ─────────────────────────────────────────────
+@app.on_event("startup")
+def _startup():
+    init_db()
 
+# ─────────────────────────────────────────────────────────
+# Health / Root (Render checks)
+# ─────────────────────────────────────────────────────────
 @app.get("/")
 def root():
     return {"ok": True, "service": "Quantaira Webhook & API"}
@@ -233,10 +217,38 @@ def root():
 @app.get("/healthz")
 def healthz():
     return {"ok": True}
+
 @app.get("/ping")
 def ping():
     return {"ok": True, "ts": now_iso_utc()}
 
+# ─────────────────────────────────────────────────────────
+# Admin / Testing helpers
+# ─────────────────────────────────────────────────────────
+@app.post("/admin/migrate")
+def admin_migrate():
+    init_db()
+    return {"ok": True, "migrated": True}
+
+@app.post("/debug/seed")
+def debug_seed():
+    """Insert a couple demo vital rows (remove in prod)."""
+    ts1 = now_iso_utc()
+    ts2 = to_iso_utc(datetime.now(timezone.utc) - timedelta(minutes=3))
+    rows = [
+        {"patient_id": "demo-001", "metric": "pulse",        "value": 77,  "ts": ts1, "device": "HWI Pulse", "gwr": None, "gwn": None, "raw": json.dumps({"seed": True})},
+        {"patient_id": "demo-001", "metric": "systolic_bp",  "value": 120, "ts": ts2, "device": "HWI BP",    "gwr": None, "gwn": None, "raw": json.dumps({"seed": True})},
+    ]
+    with engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO vitals (patient_id, metric, value, timestamp_utc, device_name, gateway_raw, gateway_norm, raw)
+            VALUES (:patient_id, :metric, :value, :ts, :device, :gwr, :gwn, :raw)
+        """), rows)
+    return {"ok": True, "inserted": len(rows)}
+
+# ─────────────────────────────────────────────────────────
+# Core data routes
+# ─────────────────────────────────────────────────────────
 @app.get("/patients")
 def patients():
     with engine.begin() as conn:
@@ -248,7 +260,7 @@ def patients():
                 SELECT patient_id FROM meals
                 UNION ALL
                 SELECT patient_id FROM notes
-            )
+            ) t
             WHERE patient_id IS NOT NULL AND patient_id <> ''
             ORDER BY patient_id
         """)).fetchall()
@@ -262,17 +274,12 @@ def gateways():
             FROM gateway_map
             ORDER BY gateway_norm, id
         """)).fetchall()
-    out = []
-    for rid, raw, normed, pid in rows:
-        out.append({"id": rid, "gateway_raw": raw, "gateway_norm": normed, "patient_id": pid or None})
+    out = [{"id": rid, "gateway_raw": raw, "gateway_norm": normed, "patient_id": pid or None}
+           for rid, raw, normed, pid in rows]
     return {"gateways": out}
 
 @app.post("/map-gateway")
 async def map_gateway(payload: Dict[str, Any]):
-    """
-    Body: { "gateway_raw": "26CC-31EB-65DF", "patient_id": "todd gross" }
-    Upserts a mapping so future webhook rows auto-attach to this patient.
-    """
     gateway_raw = (payload.get("gateway_raw") or "").strip()
     patient_id = (payload.get("patient_id") or "").strip().lower()
     if not gateway_raw or not patient_id:
@@ -284,47 +291,56 @@ async def map_gateway(payload: Dict[str, Any]):
 
     with engine.begin() as conn:
         existing = conn.execute(
-            text("SELECT id FROM gateway_map WHERE gateway_norm=:n"),
-            {"n": gateway_norm}
+            text("SELECT id FROM gateway_map WHERE gateway_norm=:n"), {"n": gateway_norm}
         ).fetchone()
         if existing:
-            conn.execute(
-                text("UPDATE gateway_map SET gateway_raw=:r, patient_id=:p WHERE gateway_norm=:n"),
-                {"r": gateway_raw, "p": patient_id, "n": gateway_norm}
-            )
+            conn.execute(text(
+                "UPDATE gateway_map SET gateway_raw=:r, patient_id=:p WHERE gateway_norm=:n"
+            ), {"r": gateway_raw, "p": patient_id, "n": gateway_norm})
         else:
             try:
-                conn.execute(
-                    text("INSERT INTO gateway_map (gateway_raw, gateway_norm, patient_id) VALUES (:r, :n, :p)"),
-                    {"r": gateway_raw, "n": gateway_norm, "p": patient_id}
-                )
+                conn.execute(text(
+                    "INSERT INTO gateway_map (gateway_raw, gateway_norm, patient_id) VALUES (:r, :n, :p)"
+                ), {"r": gateway_raw, "n": gateway_norm, "p": patient_id})
             except IntegrityError:
-                # race/dup safety
-                conn.execute(
-                    text("UPDATE gateway_map SET gateway_raw=:r, patient_id=:p WHERE gateway_norm=:n"),
-                    {"r": gateway_raw, "p": patient_id, "n": gateway_norm}
-                )
+                conn.execute(text(
+                    "UPDATE gateway_map SET gateway_raw=:r, patient_id=:p WHERE gateway_norm=:n"
+                ), {"r": gateway_raw, "p": patient_id, "n": gateway_norm})
     return {"ok": True, "gateway_norm": gateway_norm, "patient_id": patient_id}
 
+# Accept several possible header names used by Tenovi/sample tools
+def _get_webhook_key(x_webhook_key: str, x_auth_key: str, auth_key: str) -> str:
+    return (x_webhook_key or x_auth_key or auth_key or "").strip()
+
 @app.post("/webhook")
-async def webhook(req: Request, x_webhook_key: str = Header(default="")):
-    # Protect the endpoint if a key is configured
-    if TENOVI_WEBHOOK_KEY and x_webhook_key != TENOVI_WEBHOOK_KEY:
+async def webhook(
+    req: Request,
+    x_webhook_key: str = Header(default=""),
+    x_auth_key: str = Header(default=""),
+    auth_key: str = Header(default="")
+):
+    # Protect endpoint if key configured
+    sent = _get_webhook_key(x_webhook_key, x_auth_key, auth_key)
+    if TENOVI_WEBHOOK_KEY and sent != TENOVI_WEBHOOK_KEY:
         raise HTTPException(status_code=401, detail="Invalid webhook key")
 
     payload = await req.json()
-    rows: List[Dict[str, Any]] = payload if isinstance(payload, list) else [payload]
+    events: List[Dict[str, Any]] = payload if isinstance(payload, list) else [payload]
 
     to_insert: List[Dict[str, Any]] = []
     with engine.begin() as conn:
-        for r in rows:
-            # Patient inference: explicit > mapped gateway > fallback "unknown"
+        for r in events:
             patient = (r.get("patient_id") or r.get("patient") or "").strip().lower()
             metric  = (r.get("metric") or r.get("type") or "").strip().lower()
-            value   = r.get("value")
+
+            # Value mapping: prefer value, then value_1, else None
+            value = r.get("value")
+            if value is None:
+                value = r.get("value_1")
+
             ts      = r.get("timestamp_utc") or r.get("timestamp") or r.get("time")
             device  = r.get("device_name") or r.get("device")
-            gw_raw  = r.get("gateway_id") or r.get("gateway") or r.get("gateway_mac") or r.get("mac") or None
+            gw_raw  = r.get("gateway_id") or r.get("gateway") or r.get("gateway_mac") or r.get("mac")
             gw_norm = norm_gateway(gw_raw)
 
             if not patient and gw_norm:
@@ -334,16 +350,14 @@ async def webhook(req: Request, x_webhook_key: str = Header(default="")):
                 ).fetchone()
                 if mapped and mapped[0]:
                     patient = (mapped[0] or "").strip().lower()
-
             if not patient:
                 patient = "unknown"
 
-            iso = to_iso_utc(ts)
             to_insert.append({
                 "patient_id": patient,
                 "metric": metric,
                 "value": value,
-                "ts": iso,
+                "ts": to_iso_utc(ts),
                 "device": device,
                 "gateway_raw": gw_raw,
                 "gateway_norm": gw_norm,
@@ -392,13 +406,14 @@ def get_vitals(
     with engine.begin() as conn:
         rows = conn.execute(text(sql), params).fetchall()
 
-    out = []
-    for pid, m, v, ts, dev, gwn in rows:
-        out.append({
-            "patient_id": pid, "metric": m, "value": v,
-            "timestamp_utc": ts, "device_name": dev, "gateway_norm": gwn
-        })
-    return {"count": len(out), "items": out}
+    return {
+        "count": len(rows),
+        "items": [
+            {"patient_id": pid, "metric": m, "value": v, "timestamp_utc": ts,
+             "device_name": dev, "gateway_norm": gwn}
+            for (pid, m, v, ts, dev, gwn) in rows
+        ],
+    }
 
 @app.get("/meals")
 def get_meals(patient_id: str):
@@ -423,17 +438,12 @@ async def add_meal(payload: Dict[str, Any]):
     pid = (payload.get("patient_id") or "").strip().lower()
     if not pid:
         raise HTTPException(status_code=400, detail="patient_id required")
-
     ts = to_iso_utc(payload.get("timestamp_utc"))
     row = {
-        "patient_id": pid,
-        "timestamp_utc": ts,
-        "food": payload.get("food"),
-        "kcal": payload.get("kcal"),
-        "protein_g": payload.get("protein_g"),
-        "carbs_g": payload.get("carbs_g"),
-        "fat_g": payload.get("fat_g"),
-        "sodium_mg": payload.get("sodium_mg"),
+        "patient_id": pid, "timestamp_utc": ts,
+        "food": payload.get("food"), "kcal": payload.get("kcal"),
+        "protein_g": payload.get("protein_g"), "carbs_g": payload.get("carbs_g"),
+        "fat_g": payload.get("fat_g"), "sodium_mg": payload.get("sodium_mg"),
         "fdc_id": payload.get("fdc_id"),
     }
     with engine.begin() as conn:
@@ -465,10 +475,8 @@ async def add_note(payload: Dict[str, Any]):
     if not note:
         raise HTTPException(status_code=400, detail="note required")
     with engine.begin() as conn:
-        conn.execute(text("""
-            INSERT INTO notes (patient_id, timestamp_utc, note)
-            VALUES (:p, :t, :n)
-        """), {"p": pid, "t": ts, "n": note})
+        conn.execute(text("INSERT INTO notes (patient_id, timestamp_utc, note) VALUES (:p, :t, :n)"),
+                     {"p": pid, "t": ts, "n": note})
     return {"ok": True}
 
 @app.get("/limits")
@@ -480,9 +488,7 @@ def get_limits(patient_id: Optional[str] = None):
         params["p"] = patient_id.strip().lower()
     with engine.begin() as conn:
         rows = conn.execute(text(q), params).fetchall()
-    items = []
-    for pid, m, l, u in rows:
-        items.append({"patient_id": pid, "metric": m, "lsl": l, "usl": u})
+    items = [{"patient_id": pid, "metric": m, "lsl": l, "usl": u} for pid, m, l, u in rows]
     return {"count": len(items), "items": items}
 
 @app.post("/limits")
@@ -495,7 +501,6 @@ async def set_limit(payload: Dict[str, Any]):
         pid = pid.strip().lower() or None
     lsl = payload.get("lsl")
     usl = payload.get("usl")
-
     with engine.begin() as conn:
         try:
             conn.execute(text("""
@@ -511,7 +516,7 @@ async def set_limit(payload: Dict[str, Any]):
     return {"ok": True}
 
 # ─────────────────────────────────────────────────────────
-# Local dev entry (optional)
+# Local dev entry
 # ─────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn

@@ -4,8 +4,8 @@ import streamlit as st
 import requests
 import pandas as pd
 from datetime import datetime
-
-API_BASE = "https://hurtlingly-insurable-crysta.ngrok-free.dev"  # replace with Render backend URL later
+import os
+API_BASE = os.getenv("BACKEND_URL", "https://quantaira-render.onrender.com")
 
 st.set_page_config(page_title="Quantaira Dashboard — Home", layout="wide")
 

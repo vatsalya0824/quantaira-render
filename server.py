@@ -55,13 +55,72 @@ def norm_gateway(s: Optional[str]) -> Optional[str]:
     keep = "".join(ch for ch in s if ch.isalnum())
     return keep or None
 
+
 # ─────────────────────────────────────────────────────────
-# Schema / Init
+# Schema / Init  (Postgres- & SQLite-safe)
 # ─────────────────────────────────────────────────────────
 def init_db() -> None:
-    with engine.begin() as conn:
-        # vitals
-        conn.execute(text("""
+    DIALECT = engine.url.get_backend_name()
+    IS_PG = DIALECT.startswith("postgres")
+
+    if IS_PG:
+        # ---------- Postgres DDL ----------
+        vitals_sql = """
+        CREATE TABLE IF NOT EXISTS vitals (
+            id BIGSERIAL PRIMARY KEY,
+            patient_id TEXT NOT NULL,
+            metric TEXT NOT NULL,
+            value DOUBLE PRECISION,
+            timestamp_utc TIMESTAMPTZ NOT NULL,
+            device_name TEXT,
+            gateway_raw TEXT,
+            gateway_norm TEXT,
+            raw JSONB
+        );
+        """
+        meals_sql = """
+        CREATE TABLE IF NOT EXISTS meals (
+            id BIGSERIAL PRIMARY KEY,
+            patient_id TEXT NOT NULL,
+            timestamp_utc TIMESTAMPTZ NOT NULL,
+            food TEXT,
+            kcal INTEGER,
+            protein_g DOUBLE PRECISION,
+            carbs_g DOUBLE PRECISION,
+            fat_g DOUBLE PRECISION,
+            sodium_mg INTEGER,
+            fdc_id TEXT
+        );
+        """
+        notes_sql = """
+        CREATE TABLE IF NOT EXISTS notes (
+            id BIGSERIAL PRIMARY KEY,
+            patient_id TEXT NOT NULL,
+            timestamp_utc TIMESTAMPTZ NOT NULL,
+            note TEXT
+        );
+        """
+        limits_sql = """
+        CREATE TABLE IF NOT EXISTS limits (
+            id BIGSERIAL PRIMARY KEY,
+            patient_id TEXT,
+            metric TEXT NOT NULL,
+            lsl DOUBLE PRECISION,
+            usl DOUBLE PRECISION,
+            UNIQUE (patient_id, metric)
+        );
+        """
+        gateway_sql = """
+        CREATE TABLE IF NOT EXISTS gateway_map (
+            id BIGSERIAL PRIMARY KEY,
+            gateway_raw TEXT NOT NULL,
+            gateway_norm TEXT UNIQUE,
+            patient_id TEXT
+        );
+        """
+    else:
+        # ---------- SQLite DDL ----------
+        vitals_sql = """
         CREATE TABLE IF NOT EXISTS vitals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             patient_id TEXT NOT NULL,
@@ -73,10 +132,8 @@ def init_db() -> None:
             gateway_norm TEXT,
             raw TEXT
         );
-        """))
-
-        # meals (for USDA integration or manual entry)
-        conn.execute(text("""
+        """
+        meals_sql = """
         CREATE TABLE IF NOT EXISTS meals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             patient_id TEXT NOT NULL,
@@ -89,58 +146,57 @@ def init_db() -> None:
             sodium_mg INTEGER,
             fdc_id TEXT
         );
-        """))
-
-        # notes (simple patient timeline notes)
-        conn.execute(text("""
+        """
+        notes_sql = """
         CREATE TABLE IF NOT EXISTS notes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             patient_id TEXT NOT NULL,
             timestamp_utc TEXT NOT NULL,
             note TEXT
         );
-        """))
-
-        # limits (global if patient_id IS NULL)
-        conn.execute(text("""
+        """
+        limits_sql = """
         CREATE TABLE IF NOT EXISTS limits (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            patient_id TEXT,            -- NULL => global default
+            patient_id TEXT,
             metric TEXT NOT NULL,
             lsl REAL,
             usl REAL,
-            UNIQUE(patient_id, metric)
+            UNIQUE (patient_id, metric)
         );
-        """))
-
-        # gateway map (raw → normalized → patient)
-        conn.execute(text("""
+        """
+        gateway_sql = """
         CREATE TABLE IF NOT EXISTS gateway_map (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             gateway_raw TEXT NOT NULL,
             gateway_norm TEXT UNIQUE,
             patient_id TEXT
         );
-        """))
+        """
 
-        # Backfill normalized column without violating the UNIQUE constraint
-        rows = conn.execute(text("SELECT id, gateway_raw, gateway_norm FROM gateway_map")).fetchall()
-        for rid, raw_val, norm_val in rows:
-            if not norm_val:
-                n = norm_gateway(raw_val)
-                if not n:
-                    continue
-                try:
-                    conn.execute(
-                        text("UPDATE gateway_map SET gateway_norm=:n WHERE id=:i"),
-                        {"n": n, "i": rid}
-                    )
-                except IntegrityError:
-                    # Another row already owns this normalized key -> we'll dedupe below
-                    pass
+    with engine.begin() as conn:
+        conn.execute(text(vitals_sql))
+        conn.execute(text(meals_sql))
+        conn.execute(text(notes_sql))
+        conn.execute(text(limits_sql))
+        conn.execute(text(gateway_sql))
 
-        # One-shot dedupe (keep lowest id per gateway_norm)
-        # Use window function when available; otherwise emulate
+        # Backfill/normalize existing gateway_map rows safely, then dedupe
+        rows = conn.execute(text("SELECT id, gateway_raw FROM gateway_map")).fetchall()
+        for rid, raw_val in rows:
+            n = norm_gateway(raw_val)
+            if not n:
+                continue
+            try:
+                conn.execute(
+                    text("UPDATE gateway_map SET gateway_norm=:n WHERE id=:i"),
+                    {"n": n, "i": rid}
+                )
+            except IntegrityError:
+                # Another row already owns this normalized key, skip update
+                pass
+
+        # One-shot dedupe: keep the lowest id per gateway_norm
         dups = conn.execute(text("""
             WITH ranked AS (
                 SELECT id, gateway_norm,
@@ -152,8 +208,6 @@ def init_db() -> None:
         """)).fetchall()
         for (dup_id,) in dups:
             conn.execute(text("DELETE FROM gateway_map WHERE id=:i"), {"i": dup_id})
-
-init_db()
 
 # ─────────────────────────────────────────────────────────
 # App

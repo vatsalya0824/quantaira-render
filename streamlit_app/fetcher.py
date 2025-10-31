@@ -3,7 +3,8 @@
 import requests
 import pandas as pd
 
-API_BASE = "https://hurtlingly-insurable-crysta.ngrok-free.dev"  # replace with your Render backend URL
+import os
+API_BASE = os.getenv("BACKEND_URL", "https://quantaira-render.onrender.com")
 
 def fetch_data(hours=24, patient_id=None, metric=None):
     """Fetch vitals from backend with optional filters."""

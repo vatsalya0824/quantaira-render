@@ -222,6 +222,17 @@ app.add_middleware(
 # ─────────────────────────────────────────────────────────
 # Routes
 # ─────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# Health + Root endpoints (for Render)
+# ─────────────────────────────────────────────
+
+@app.get("/")
+def root():
+    return {"ok": True, "service": "Quantaira Webhook & API"}
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
 @app.get("/ping")
 def ping():
     return {"ok": True, "ts": now_iso_utc()}

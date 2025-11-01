@@ -3,131 +3,207 @@ from __future__ import annotations
 
 import os
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 import pandas as pd
 import requests
-
-# If used inside Streamlit, we'll optionally cache
-try:
-    import streamlit as st
-    cache_fn = st.cache_data
-except Exception:  # running outside Streamlit
-    def cache_fn(*args, **kwargs):
-        def deco(f): return f
-        return deco
+import streamlit as st
 
 # ─────────────────────────────────────────────
-# Config
+# Config: where is the backend?
+# Priority: env BACKEND_URL → st.secrets["BACKEND_URL"] → localhost
+# Example: BACKEND_URL="https://quantaira-backend.onrender.com"
 # ─────────────────────────────────────────────
-def _backend_base() -> str:
-    """
-    Resolve backend base URL from:
-      1) env var BACKEND_URL
-      2) st.secrets['BACKEND_URL']
-    Raises if not found.
-    """
-    env_url = os.getenv("BACKEND_URL")
-    if env_url and env_url.strip():
-        base = env_url.strip()
-    else:
-        try:
-            base = st.secrets.get("BACKEND_URL", "").strip()  # type: ignore[name-defined]
-        except Exception:
-            base = ""
-    if not base:
-        raise RuntimeError(
-            "BACKEND_URL not configured. Set env var BACKEND_URL or add it to .streamlit/secrets.toml"
-        )
-    return base[:-1] if base.endswith("/") else base
+def _get_base_url() -> str:
+    url = (
+        os.getenv("BACKEND_URL")
+        or (st.secrets.get("BACKEND_URL") if hasattr(st, "secrets") else None)
+        or "http://localhost:8000"
+    )
+    return url.rstrip("/")
 
+BASE_URL = _get_base_url()
 
-_session = requests.Session()
-_DEFAULT_TIMEOUT = 12  # seconds
-_MAX_RETRIES = 3
+# Toggle to allow local demo if backend is down (optional).
+_FAKE_MODE = os.getenv("FAKE_MODE", "").lower() in {"1", "true", "yes"}
 
+# ─────────────────────────────────────────────
+# HTTP client helpers (retries + timeouts)
+# ─────────────────────────────────────────────
+_DEFAULT_TIMEOUT = 20
+
+def _url(path: str) -> str:
+    if not path.startswith("/"):
+        path = "/" + path
+    return BASE_URL + path
 
 def _request_json(
     method: str,
     path: str,
     *,
     params: Optional[Dict[str, Any]] = None,
+    json: Optional[Dict[str, Any]] = None,
+    retries: int = 2,
     timeout: int = _DEFAULT_TIMEOUT,
 ) -> Any:
     """
-    Small JSON helper with retries + exponential backoff.
+    Issue an HTTP request and return r.json().
+    Retries a couple of times on transient 5xx/connection errors.
+    Raises on final failure.
     """
-    url = f"{_backend_base()}{path}"
-    last_err: Optional[Exception] = None
-    for attempt in range(1, _MAX_RETRIES + 1):
+    session = requests.Session()
+    last_exc: Optional[Exception] = None
+    for attempt in range(retries + 1):
         try:
-            resp = _session.request(method, url, params=params, timeout=timeout)
+            resp = session.request(
+                method.upper(),
+                _url(path),
+                params=params,
+                json=json,
+                timeout=timeout,
+            )
+            # Raise on HTTP 4xx/5xx to enter except branch
             resp.raise_for_status()
-            # Some providers return text/plain JSON; force parse
-            return resp.json()
-        except Exception as e:
-            last_err = e
-            if attempt == _MAX_RETRIES:
-                break
-            time.sleep(0.8 * attempt)  # backoff
-    # If we got here, we failed
-    raise RuntimeError(f"Request failed for {url}: {last_err}")
-
+            # Try to parse JSON; if it fails, raise a clean error
+            try:
+                return resp.json()
+            except ValueError as e:
+                raise RuntimeError(f"{method} {_url(path)} did not return JSON") from e
+        except (requests.RequestException, RuntimeError) as e:
+            last_exc = e
+            # Only retry on the first N attempts
+            if attempt < retries:
+                # small backoff
+                time.sleep(0.6 * (attempt + 1))
+                continue
+            # Exhausted
+            break
+    # If we're here, we failed
+    if _FAKE_MODE and path.strip("/") in {"patients", "vitals"}:
+        return _fake_response(path, params or {})
+    raise last_exc  # type: ignore[misc]
 
 # ─────────────────────────────────────────────
-# Public API used by your Streamlit pages
+# Cache wrapper (Streamlit 1.20+)
+# ─────────────────────────────────────────────
+def cache_fn(ttl: int = 20):
+    def deco(fn):
+        return st.cache_data(show_spinner=False, ttl=ttl)(fn)
+    return deco
+
+# ─────────────────────────────────────────────
+# Public API used by the Streamlit pages
 # ─────────────────────────────────────────────
 @cache_fn(ttl=20)
 def fetch_patients() -> pd.DataFrame:
     """
-    GET /patients  → DataFrame with columns like: id, name, age, gender
+    GET /patients  → returns a list[dict]
+    Frontend expects a DataFrame with at least: id, name
     """
     data = _request_json("GET", "/patients")
     if not isinstance(data, list):
-        data = []
+        # Old shapes like {"items":[...]} are tolerated
+        if isinstance(data, dict) and "items" in data and isinstance(data["items"], list):
+            data = data["items"]
+        else:
+            data = []
     df = pd.DataFrame(data)
-    # normalize types a bit
     if "id" in df.columns:
         df["id"] = df["id"].astype(str)
     return df
 
 
-@cache_fn(ttl=8)  # vitals change more often
-def fetch_data(hours: int = 24, patient_id: str = "todd") -> pd.DataFrame:
+@cache_fn(ttl=8)
+def fetch_data(*, hours: int = 24, patient_id: Optional[str] = None) -> pd.DataFrame:
     """
-    GET /api/v1/vitals?hours=H&patient_id=PID
-    Expected schema from backend:
-      - timestamp_utc: ISO8601 UTC string
-      - metric: "pulse" | "spo2" | "blood_pressure" | "pillbox_opened"
-      - value: number for pulse/spo2; "SYS/DIA" string for blood_pressure; 1 for pill events
-    Returns a tidy DataFrame with a parsed UTC timestamp column `timestamp_utc`.
+    GET /vitals?hours=H[&patient_id=X]
+    Returns a list of measurements. We normalize to columns:
+      - timestamp_utc (ISO string or pandas ts)
+      - metric        (str)
+      - value         (numeric/str)
+    Optional pass-through columns (if backend provides them):
+      - device_name, value_1, value_2, unit, source
     """
-    params = {"hours": int(hours), "patient_id": str(patient_id)}
-    data = _request_json("GET", "/api/v1/vitals", params=params)
+    params: Dict[str, Any] = {"hours": int(hours)}
+    if patient_id:
+        params["patient_id"] = str(patient_id)
 
-    if not isinstance(data, list) or not data:
-        return pd.DataFrame(columns=["timestamp_utc", "metric", "value"])
+    data = _request_json("GET", "/vitals", params=params)
+
+    # Accept list or dict{"items":[...]}
+    if isinstance(data, dict) and "items" in data and isinstance(data["items"], list):
+        data = data["items"]
+    if not isinstance(data, list):
+        data = []
 
     df = pd.DataFrame(data)
 
-    # Ensure expected columns exist
-    for col in ("timestamp_utc", "metric", "value"):
-        if col not in df.columns:
-            df[col] = pd.NA
+    # Normalize critical columns
+    if "timestamp_utc" not in df.columns:
+        # try common alternatives
+        for cand in ("ts", "timestamp", "time_utc", "created_at_utc"):
+            if cand in df.columns:
+                df["timestamp_utc"] = df[cand]
+                break
+    # Ensure datetime (UTC)
+    if "timestamp_utc" in df.columns:
+        df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True, errors="coerce")
 
-    # Parse timestamps as UTC (errors → NaT, filtered out by caller if needed)
-    df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True, errors="coerce")
+    if "metric" in df.columns:
+        df["metric"] = df["metric"].astype(str).str.strip().str.lower()
 
-    # Light normalization
-    df["metric"] = df["metric"].astype(str).str.strip().str.lower()
+    # If backend sends nested BP (e.g., "120/80" in 'value'), that's handled later
+    # by common.split_blood_pressure(). Here we just keep 'value' raw and try numeric fallback.
+    if "value" in df.columns:
+        # Keep original, but also try numeric where possible; pages can re-cast as needed
+        df["value"] = df["value"]
 
-    return df
+    # Keep only rows with timestamp
+    if "timestamp_utc" in df.columns:
+        df = df.dropna(subset=["timestamp_utc"]).sort_values("timestamp_utc")
+
+    return df.reset_index(drop=True)
 
 
+# ─────────────────────────────────────────────
+# Optional: tiny fake data for local demos (when FAKE_MODE=1)
+# ─────────────────────────────────────────────
+def _fake_response(path: str, params: Dict[str, Any]) -> Any:
+    if path.strip("/") == "patients":
+        return [
+            {"id": "todd", "name": "Todd Carter", "age": 47, "gender": "Male"},
+            {"id": "jane", "name": "Jane Wilson", "age": 53, "gender": "Female"},
+        ]
+    if path.strip("/") == "vitals":
+        import numpy as np
+        from datetime import datetime, timedelta, timezone
+        hours = int(params.get("hours", 24))
+        pid = params.get("patient_id") or "todd"
+        now = datetime.now(timezone.utc)
+        ts = [now - timedelta(minutes=15 * i) for i in range(hours * 4)]
+        ts = list(reversed(ts))
+        hr = 72 + 8 * np.sin(np.linspace(0, 8, len(ts)))
+        spo2 = 97 + np.sin(np.linspace(0, 6, len(ts))) * 0.6
+        sbp = 120 + 10 * np.sin(np.linspace(0, 5, len(ts)))
+        dbp = 78 + 6 * np.cos(np.linspace(0, 5, len(ts)))
+        out = []
+        for i, t in enumerate(ts):
+            out.append({"patient_id": pid, "timestamp_utc": t.isoformat(), "metric": "pulse", "value": float(hr[i])})
+            out.append({"patient_id": pid, "timestamp_utc": t.isoformat(), "metric": "spo2", "value": float(spo2[i])})
+            # Some backends may send a combined BP string; we’ll send split metrics here
+            out.append({"patient_id": pid, "timestamp_utc": t.isoformat(), "metric": "systolic_bp", "value": float(sbp[i])})
+            out.append({"patient_id": pid, "timestamp_utc": t.isoformat(), "metric": "diastolic_bp", "value": float(dbp[i])})
+        return out
+    return {"ok": False, "error": "unknown path in fake mode"}
+
+
+# ─────────────────────────────────────────────
+# Simple health check (optional)
+# ─────────────────────────────────────────────
 @cache_fn(ttl=10)
-def health() -> Dict[str, Any]:
-    """GET /health for quick diagnostics."""
+def backend_health() -> dict:
     try:
-        return _request_json("GET", "/health")
+        data = _request_json("GET", "/")
+        return {"ok": True, "base_url": BASE_URL, "data": data}
     except Exception as e:
-        return {"status": "error", "detail": str(e)}
+        return {"ok": False, "base_url": BASE_URL, "error": str(e)}

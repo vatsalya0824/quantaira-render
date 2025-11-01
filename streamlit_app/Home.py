@@ -5,7 +5,7 @@ import requests
 import pandas as pd
 from datetime import datetime
 import os
-API_BASE = os.getenv("BACKEND_URL", "https://quantaira-render.onrender.com")
+API_BASE = os.getenv("BACKEND_URL", "https://quantaira-backend.onrender.com")
 
 st.set_page_config(page_title="Quantaira Dashboard — Home", layout="wide")
 

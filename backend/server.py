@@ -232,12 +232,49 @@ async def _tenovi_handler(
 
     return {"ok": True, "inserted": inserted}
 
-@app.post("/webhook/tenovi")
-async def tenovi_webhook_singular(
+async def _tenovi_handler(
     request: Request,
     x_webhook_key: Optional[str] = Header(default=None, alias="X-Webhook-Key"),
-):
-    return await _tenovi_handler(request, x_webhook_key)
+) -> Dict[str, Any]:
+    # 1) header check
+    if TENOVI_EXPECTED_KEY and x_webhook_key != TENOVI_EXPECTED_KEY:
+        raise HTTPException(status_code=401, detail="invalid webhook key")
+
+    # 2) read body (handle empty or invalid)
+    try:
+        body = await request.body()
+        eid = hashlib.sha256(body).hexdigest()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"unable to read body: {e}")
+
+    if not body.strip():
+        return {"ok": True, "message": "empty webhook body (test ping acknowledged)"}
+
+    # 3) idempotency
+    if _seen_before(eid):
+        return {"ok": True, "duplicate": True}
+    _mark_seen(eid)
+
+    # 4) parse JSON safely
+    try:
+        payload = await request.json()
+    except Exception:
+        return {"ok": False, "error": "invalid JSON"}
+
+    # handle both object and list
+    inserted = 0
+    if isinstance(payload, list):
+        items = [p for p in payload if isinstance(p, dict)]
+        if items:
+            inserted = _ingest_payload_items(items)
+        else:
+            return {"ok": True, "message": "empty array (no measurements)"}
+    elif isinstance(payload, dict):
+        inserted = _ingest_payload_items([payload])
+    else:
+        return {"ok": False, "error": f"unsupported payload type {type(payload)}"}
+
+    return {"ok": True, "inserted": inserted}
 
 @app.post("/webhooks/tenovi")
 async def tenovi_webhook_plural(

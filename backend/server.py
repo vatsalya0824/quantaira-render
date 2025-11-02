@@ -195,8 +195,9 @@ MOCK_PATIENTS: List[Dict[str, Any]] = [
 ]
 
 @app.get("/patients")
-def get_patients() -> List[Dict[str, Any]]:
-    return MOCK_PATIENTS
+def get_patients() -> Dict[str, Any]:
+    patients = load_patients_from_db()
+    return {"items": patients}
 
 # Optional: proxy to Tenovi patient API if TENOVI_API_KEY is set
 @app.get("/tenovi/patients")

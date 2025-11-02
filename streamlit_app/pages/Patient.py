@@ -16,7 +16,7 @@ from streamlit.components.v1 import html as st_html
 import requests
 
 # ⬇️ Correct import: use fetch_vitals (not fetch_data)
-from fetcher import fetch_vitals
+from fetcher import fetch_data
 import common
 common = reload(common)
 from common import best_ts_col, convert_tz, split_blood_pressure
@@ -221,7 +221,7 @@ st.markdown('</div>', unsafe_allow_html=True)
 # ─────────────────────────────────────────────
 def load_window(hours: int) -> pd.DataFrame:
     try:
-        df = fetch_vitals(patient_id=pid, hours=hours)   # ✅ fixed
+        df = fetch_data(patient_id=pid, hours=hours)   # ✅ fixed
     except Exception:
         df = None
     if df is None or df.empty: return pd.DataFrame()

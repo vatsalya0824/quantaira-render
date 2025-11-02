@@ -1,6 +1,6 @@
 # pages/Patient.py — iOS teal pills + green-above / yellow-normal / red-below,
 # meals & notes markers fixed (UTC matching), stable forms,
-# 3d/7d window ok, and **per-patient persistence to CSV**.
+# 3d/7d window ok, and per-patient persistence to CSV.
 
 from datetime import datetime
 from pathlib import Path
@@ -15,7 +15,8 @@ import streamlit as st
 from streamlit.components.v1 import html as st_html
 import requests
 
-from fetcher import fetch_data
+# ⬇️ Correct import: use fetch_vitals (not fetch_data)
+from fetcher import fetch_vitals
 import common
 common = reload(common)
 from common import best_ts_col, convert_tz, split_blood_pressure
@@ -82,7 +83,6 @@ def load_notes(pid: str) -> pd.DataFrame:
     return df[NOTE_COLS].dropna(subset=["timestamp_utc"])
 
 def save_meals(pid: str, df: pd.DataFrame):
-    # Keep only expected cols in a stable order; write ISO timestamps
     out = df.copy()
     out["timestamp_utc"] = pd.to_datetime(out["timestamp_utc"], utc=True, errors="coerce")
     out = out[MEAL_COLS].sort_values("timestamp_utc").reset_index(drop=True)
@@ -221,8 +221,7 @@ st.markdown('</div>', unsafe_allow_html=True)
 # ─────────────────────────────────────────────
 def load_window(hours: int) -> pd.DataFrame:
     try:
-        # ✅ ensure vitals are per-patient
-        df = fetch_data(hours=hours, patient_id=pid)
+        df = fetch_vitals(patient_id=pid, hours=hours)   # ✅ fixed
     except Exception:
         df = None
     if df is None or df.empty: return pd.DataFrame()
@@ -231,7 +230,7 @@ def load_window(hours: int) -> pd.DataFrame:
     df["timestamp_utc"] = pd.to_datetime(df[ts_col], utc=True, errors="coerce")
     return df.dropna(subset=["timestamp_utc"])
 
-raw = load_window(HOURS_LOOKUP[st.session_state.win])
+raw = load_window({"24h":24, "3d":72, "7d":7*24, "30d":30*24}[st.session_state.win])
 raw = split_blood_pressure(raw)
 
 if raw.empty:
@@ -263,7 +262,6 @@ def prepare(df: pd.DataFrame, tz_name: str):
     return plot_df, pill_events
 
 plot_df, pill_events = prepare(raw, tz_choice)
-metric = st.session_state.metric_sel
 
 # ─────────────────────────────────────────────
 # Limits helpers
@@ -301,7 +299,7 @@ def nearest_indices_utc(x_ts, event_ts_list):
     return sorted(set(out))
 
 # ─────────────────────────────────────────────
-# Chart.js renderers (colors fixed)
+# Chart.js renderers
 # ─────────────────────────────────────────────
 def chartjs_single_with_markers(x, y, pill_idx, meal_idx, note_idx, lsl, usl, key="cj_single", height=460):
     labels = [pd.to_datetime(t).strftime("%b %d %H:%M") for t in x]
@@ -339,11 +337,11 @@ def chartjs_single_with_markers(x, y, pill_idx, meal_idx, note_idx, lsl, usl, ke
             cubicInterpolationMode: 'monotone', pointRadius: 0, spanGaps: true,
             segment: { borderColor: s => {
               const y0 = s.p0.parsed.y, y1 = s.p1.parsed.y;
-              if (y0==null || y1==null) return C_YELLOW;  // default normal
+              if (y0==null || y1==null) return C_YELLOW;
               const m = (y0 + y1)/2;
-              if (USL!=null && m>USL) return C_GREEN;     // GREEN = above
-              if (LSL!=null && m<LSL) return C_RED;       // RED = below
-              return C_YELLOW;                             // YELLOW = normal
+              if (USL!=null && m>USL) return C_GREEN;
+              if (LSL!=null && m<LSL) return C_RED;
+              return C_YELLOW;
             }}
           },
           { data:${pill_points}, showLine:false, borderColor:'{pill}', backgroundColor:'{pill}',

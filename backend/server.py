@@ -195,7 +195,12 @@ def _normalize_event(ev: Dict[str, Any]) -> List[Dict[str, Any]]:
 async def tenovi_webhook_plural(
     request: Request,
     x_webhook_key: Optional[str] = Header(None, convert_underscores=False),
+    authorization: Optional[str] = Header(None)
 ) -> Dict[str, Any]:
+    # auth (accept either X-Webhook-Key or Authorization)
+    provided_key = x_webhook_key or authorization
+    if TENOVI_EXPECTED_KEY and (not provided_key or provided_key.strip() != TENOVI_EXPECTED_KEY):
+        raise HTTPException(status_code=401, detail="Invalid Webhook Key")
     # auth (Render env → TENOVI_EXPECTED_KEY, Tenovi “Authorization Header Key” → X-Webhook-Key)
     if TENOVI_EXPECTED_KEY and (x_webhook_key or "").strip() != TENOVI_EXPECTED_KEY:
         raise HTTPException(status_code=401, detail="Invalid X-Webhook-Key")

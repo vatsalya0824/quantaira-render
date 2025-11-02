@@ -1,6 +1,7 @@
 # backend/server.py
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -8,20 +9,20 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Union
 
 import requests
-from fastapi import FastAPI, Query, Request, HTTPException, Header
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 APP_NAME = os.getenv("APP_NAME", "quantaira-backend")
 
-# ── Tenovi + storage settings (set in Render → Environment) ───────────────
+# ── Config (set via Render → Environment) ──────────────────────────────────
 TENOVI_EXPECTED_KEY = os.getenv("TENOVI_EXPECTED_KEY", "quantaira_data_123")  # header value
-TENOVI_API_KEY = os.getenv("TENOVI_API_KEY")  # optional, only for /tenovi/patients proxy
+TENOVI_API_KEY = os.getenv("TENOVI_API_KEY")  # optional, for /tenovi/patients
 DATA_FILE = os.getenv("VITALS_JSONL_PATH", "/data/vitals.jsonl")
 SEEN_FILE = os.getenv("VITALS_SEEN_PATH", "/data/seen_ids.jsonl")
 
-app = FastAPI(title="Quantaira Backend", version="1.3.0")
+app = FastAPI(title="Quantaira Backend", version="1.4.0")
 
-# ── CORS: allow Streamlit UI to call us ───────────────────────────────────
+# ── CORS (allow Streamlit UI) ─────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -30,13 +31,27 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Small utils ───────────────────────────────────────────────────────────
+# ── Utilities (with auto-fallback to /tmp if /data not writable) ─────────
+def _ensure_parent_dir(path: str) -> str:
+    """Ensure parent dir exists; if permission denied, rewrite to /tmp/<file>."""
+    parent = os.path.dirname(path) or "."
+    try:
+        os.makedirs(parent, exist_ok=True)
+        return path
+    except OSError as e:
+        if e.errno == errno.EACCES:  # permission denied
+            alt = os.path.join("/tmp", os.path.basename(path))
+            os.makedirs("/tmp", exist_ok=True)
+            return alt
+        raise
+
 def _append_jsonl(path: str, obj: Dict[str, Any]) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    path = _ensure_parent_dir(path)
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
 def _read_jsonl(path: str) -> List[Dict[str, Any]]:
+    path = _ensure_parent_dir(path)
     out: List[Dict[str, Any]] = []
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -53,13 +68,14 @@ def _read_jsonl(path: str) -> List[Dict[str, Any]]:
     return out
 
 def _mark_seen(eid: str) -> None:
-    os.makedirs(os.path.dirname(SEEN_FILE), exist_ok=True)
-    with open(SEEN_FILE, "a", encoding="utf-8") as f:
+    path = _ensure_parent_dir(SEEN_FILE)
+    with open(path, "a", encoding="utf-8") as f:
         f.write(eid + "\n")
 
 def _seen_before(eid: str) -> bool:
+    path = _ensure_parent_dir(SEEN_FILE)
     try:
-        with open(SEEN_FILE, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             for line in f:
                 if line.strip() == eid:
                     return True
@@ -68,6 +84,7 @@ def _seen_before(eid: str) -> bool:
     return False
 
 def _utc_iso(ts: Any) -> str:
+    """Coerce to UTC ISO8601."""
     if ts is None:
         return datetime.now(timezone.utc).isoformat()
     if isinstance(ts, (int, float)):
@@ -81,6 +98,7 @@ def _utc_iso(ts: Any) -> str:
         return datetime.now(timezone.utc).isoformat()
 
 def _split_bp(val: str) -> List[Dict[str, Any]]:
+    """'120/80' → [{'metric':'systolic_bp','value':120}, {'metric':'diastolic_bp','value':80}]"""
     try:
         s, d = [float(x.strip()) for x in str(val).split("/", 1)]
         return [
@@ -91,9 +109,8 @@ def _split_bp(val: str) -> List[Dict[str, Any]]:
         return [{"metric": "blood_pressure", "value": str(val), "unit": ""}]
 
 def _normalize_one(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Normalize ONE Tenovi-like object to our rows."""
+    """Normalize one Tenovi-like object into rows our frontend understands."""
     rows: List[Dict[str, Any]] = []
-
     patient_id = (
         payload.get("patient_id")
         or payload.get("user_id")
@@ -101,7 +118,6 @@ def _normalize_one(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
         or (payload.get("user") or {}).get("id")
         or "unknown"
     )
-
     base_ts = _utc_iso(
         payload.get("timestamp")
         or payload.get("time")
@@ -109,7 +125,7 @@ def _normalize_one(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
         or (payload.get("reading") or {}).get("time")
     )
 
-    # BP "120/80"
+    # Combined BP
     if "bp" in payload:
         for r in _split_bp(payload["bp"]):
             rows.append({
@@ -134,7 +150,8 @@ def _normalize_one(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
         if metric is not None and value is not None:
             rows.append({
                 "timestamp_utc": _utc_iso(r.get("timestamp") or r.get("time") or base_ts),
-                "patient_id": str(patient_id), "metric": str(metric).strip().lower(),
+                "patient_id": str(patient_id),
+                "metric": str(metric).strip().lower(),
                 "value": value, "unit": str(unit), "source": "tenovi",
             })
 
@@ -156,7 +173,8 @@ def _normalize_one(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
             else:
                 rows.append({
                     "timestamp_utc": m_ts, "patient_id": str(patient_id),
-                    "metric": str(metric).strip().lower(), "value": value, "unit": str(unit), "source": "tenovi",
+                    "metric": str(metric).strip().lower(),
+                    "value": value, "unit": str(unit), "source": "tenovi",
                 })
     return rows
 
@@ -169,7 +187,7 @@ def root() -> Dict[str, Any]:
 def health() -> Dict[str, str]:
     return {"status": "ok"}
 
-# ── Patients (demo) ──────────────────────────────────────────────────────
+# ── Demo patients ─────────────────────────────────────────────────────────
 MOCK_PATIENTS: List[Dict[str, Any]] = [
     {"id": "todd", "name": "Todd Carter", "age": 47, "gender": "Male"},
     {"id": "jane", "name": "Jane Wilson", "age": 53, "gender": "Female"},
@@ -180,7 +198,7 @@ MOCK_PATIENTS: List[Dict[str, Any]] = [
 def get_patients() -> List[Dict[str, Any]]:
     return MOCK_PATIENTS
 
-# (Optional) pass-through to Tenovi patient API if you set TENOVI_API_KEY
+# Optional: proxy to Tenovi patient API if TENOVI_API_KEY is set
 @app.get("/tenovi/patients")
 def tenovi_patients(search: str = "", page: int = 1, page_size: int = 10):
     if not TENOVI_API_KEY:
@@ -197,7 +215,7 @@ def tenovi_patients(search: str = "", page: int = 1, page_size: int = 10):
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-# ── Tenovi webhook (header auth, array or object, idempotent) ────────────
+# ── Tenovi webhook (plural + singular) ────────────────────────────────────
 def _ingest_payload_items(items: List[Dict[str, Any]]) -> int:
     inserted = 0
     for obj in items:
@@ -210,65 +228,32 @@ async def _tenovi_handler(
     request: Request,
     x_webhook_key: Optional[str] = Header(default=None, alias="X-Webhook-Key"),
 ) -> Dict[str, Any]:
-    # 1) header check
+    # 1) header auth
     if TENOVI_EXPECTED_KEY and x_webhook_key != TENOVI_EXPECTED_KEY:
         raise HTTPException(status_code=401, detail="invalid webhook key")
 
-    # 2) idempotency
+    # 2) read body; acknowledge empty test payloads
     body = await request.body()
+    if not body.strip():
+        return {"ok": True, "message": "empty webhook body (test acknowledged)"}
+
+    # 3) idempotency on raw body
     eid = hashlib.sha256(body).hexdigest()
     if _seen_before(eid):
         return {"ok": True, "duplicate": True}
     _mark_seen(eid)
 
-    # 3) parse JSON (array or object)
-    payload: Union[List[Dict[str, Any]], Dict[str, Any]] = await request.json()
-    if isinstance(payload, list):
-        inserted = _ingest_payload_items([p for p in payload if isinstance(p, dict)])
-    elif isinstance(payload, dict):
-        inserted = _ingest_payload_items([payload])
-    else:
-        raise HTTPException(status_code=400, detail="unsupported payload type")
-
-    return {"ok": True, "inserted": inserted}
-
-async def _tenovi_handler(
-    request: Request,
-    x_webhook_key: Optional[str] = Header(default=None, alias="X-Webhook-Key"),
-) -> Dict[str, Any]:
-    # 1) header check
-    if TENOVI_EXPECTED_KEY and x_webhook_key != TENOVI_EXPECTED_KEY:
-        raise HTTPException(status_code=401, detail="invalid webhook key")
-
-    # 2) read body (handle empty or invalid)
+    # 4) parse JSON and ingest
     try:
-        body = await request.body()
-        eid = hashlib.sha256(body).hexdigest()
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"unable to read body: {e}")
-
-    if not body.strip():
-        return {"ok": True, "message": "empty webhook body (test ping acknowledged)"}
-
-    # 3) idempotency
-    if _seen_before(eid):
-        return {"ok": True, "duplicate": True}
-    _mark_seen(eid)
-
-    # 4) parse JSON safely
-    try:
-        payload = await request.json()
+        payload: Union[List[Dict[str, Any]], Dict[str, Any]] = await request.json()
     except Exception:
         return {"ok": False, "error": "invalid JSON"}
 
-    # handle both object and list
-    inserted = 0
     if isinstance(payload, list):
         items = [p for p in payload if isinstance(p, dict)]
-        if items:
-            inserted = _ingest_payload_items(items)
-        else:
+        if not items:
             return {"ok": True, "message": "empty array (no measurements)"}
+        inserted = _ingest_payload_items(items)
     elif isinstance(payload, dict):
         inserted = _ingest_payload_items([payload])
     else:
@@ -283,15 +268,26 @@ async def tenovi_webhook_plural(
 ):
     return await _tenovi_handler(request, x_webhook_key)
 
-# ── Synthetic vitals (fallback) ───────────────────────────────────────────
+@app.post("/webhook/tenovi")
+async def tenovi_webhook_singular(
+    request: Request,
+    x_webhook_key: Optional[str] = Header(default=None, alias="X-Webhook-Key"),
+):
+    return await _tenovi_handler(request, x_webhook_key)
+
+# ── Synthetic vitals + serving recent webhook data ────────────────────────
 def _seed_for_patient(pid: str) -> int:
     return sum(ord(c) for c in pid) % 7
+
 def _bp_for_index(i: int, base_sys: int = 120, base_dia: int = 78) -> str:
     return f"{base_sys + (i % 5) - 2}/{base_dia + ((i // 2) % 5) - 2}"
+
 def _hr_for_index(i: int, base: int = 72) -> int:
     return base + (i % 5) - 2
+
 def _spo2_for_index(i: int, base: int = 97) -> int:
     return base - (1 if i % 13 == 0 else 0)
+
 def _make_point(ts: datetime, metric: str, value: Any) -> Dict[str, Any]:
     return {"timestamp_utc": ts.replace(tzinfo=timezone.utc).isoformat(), "metric": metric, "value": value}
 

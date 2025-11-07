@@ -1,10 +1,7 @@
 # backend/server.py
 from __future__ import annotations
 
-import errno
-import hashlib
-import json
-import os
+import errno, hashlib, json, os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Union
 
@@ -14,24 +11,22 @@ from fastapi.middleware.cors import CORSMiddleware
 
 APP_NAME = os.getenv("APP_NAME", "quantaira-backend")
 
-# ── Config (Render → Environment) ─────────────────────────────────────────
-TENOVI_EXPECTED_KEY = os.getenv("TENOVI_EXPECTED_KEY", "quantaira_data_123")  # header value
-TENOVI_API_KEY      = os.getenv("TENOVI_API_KEY")  # optional, for /tenovi/patients
+# ── Config from Render env ────────────────────────────────────────────────
+TENOVI_EXPECTED_KEY = os.getenv("TENOVI_EXPECTED_KEY", "quantaira_data_123")
+TENOVI_API_KEY      = os.getenv("TENOVI_API_KEY")  # optional (patients proxy)
 DATA_FILE           = os.getenv("VITALS_JSONL_PATH", "/data/vitals.jsonl")
 SEEN_FILE           = os.getenv("VITALS_SEEN_PATH",  "/data/seen_ids.jsonl")
+DEBUG_LAST_PAYLOAD  = os.getenv("DEBUG_LAST_PAYLOAD","/data/last_payload.bin")
 
-app = FastAPI(title="Quantaira Backend", version="1.4.0")
+app = FastAPI(title="Quantaira Backend", version="1.5.0")
 
-# ── CORS (allow Streamlit UI) ─────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
 )
 
-# ── Utilities (fallback to /tmp if /data not writable) ───────────────────
+# ── FS helpers (auto-fallback to /tmp) ───────────────────────────────────
 def _ensure_parent_dir(path: str) -> str:
     parent = os.path.dirname(path) or "."
     try:
@@ -67,14 +62,14 @@ def _read_jsonl(path: str) -> List[Dict[str, Any]]:
     return out
 
 def _mark_seen(eid: str) -> None:
-    path = _ensure_parent_dir(SEEN_FILE)
-    with open(path, "a", encoding="utf-8") as f:
+    p = _ensure_parent_dir(SEEN_FILE)
+    with open(p, "a", encoding="utf-8") as f:
         f.write(eid + "\n")
 
 def _seen_before(eid: str) -> bool:
-    path = _ensure_parent_dir(SEEN_FILE)
+    p = _ensure_parent_dir(SEEN_FILE)
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(p, "r", encoding="utf-8") as f:
             for line in f:
                 if line.strip() == eid:
                     return True
@@ -99,7 +94,7 @@ def _split_bp(val: str) -> List[Dict[str, Any]]:
     try:
         s, d = [float(x.strip()) for x in str(val).split("/", 1)]
         return [
-            {"metric": "systolic_bp", "value": s, "unit": "mmHg"},
+            {"metric": "systolic_bp",  "value": s, "unit": "mmHg"},
             {"metric": "diastolic_bp", "value": d, "unit": "mmHg"},
         ]
     except Exception:
@@ -115,13 +110,12 @@ def _normalize_one(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
         or "unknown"
     )
     base_ts = _utc_iso(
-        payload.get("timestamp")
-        or payload.get("time")
+        payload.get("timestamp") or payload.get("time")
         or (payload.get("reading") or {}).get("timestamp")
         or (payload.get("reading") or {}).get("time")
     )
 
-    # Combined BP string
+    # Combined BP
     if "bp" in payload:
         for r in _split_bp(payload["bp"]):
             rows.append({
@@ -129,32 +123,35 @@ def _normalize_one(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "metric": r["metric"], "value": r["value"], "unit": r.get("unit", ""), "source": "tenovi",
             })
 
-    # Flat {type,value}
+    # Flat type/value
     if "type" in payload and "value" in payload:
         rows.append({
             "timestamp_utc": base_ts, "patient_id": str(patient_id),
-            "metric": str(payload["type"]).strip().lower(),
+            "metric": str(payload["type"]).lower().strip(),
             "value": payload["value"], "unit": str(payload.get("unit", "")), "source": "tenovi",
         })
 
-    # Nested {reading:{...}}
+    # Nested reading
     if isinstance(payload.get("reading"), dict):
         r = payload["reading"]
         metric = r.get("metric") or r.get("type")
-        value = r.get("value"); unit = r.get("unit", "")
+        value = r.get("value")
+        unit = r.get("unit", "")
         if metric is not None and value is not None:
             rows.append({
                 "timestamp_utc": _utc_iso(r.get("timestamp") or r.get("time") or base_ts),
-                "patient_id": str(patient_id), "metric": str(metric).strip().lower(),
+                "patient_id": str(patient_id),
+                "metric": str(metric).lower().strip(),
                 "value": value, "unit": str(unit), "source": "tenovi",
             })
 
-    # measurements: [...]
+    # measurements list
     if isinstance(payload.get("measurements"), list):
         for m in payload["measurements"]:
             metric = m.get("metric") or m.get("type")
-            value  = m.get("value"); unit = m.get("unit", "")
-            m_ts   = _utc_iso(m.get("timestamp") or m.get("time") or base_ts)
+            value = m.get("value")
+            unit = m.get("unit", "")
+            m_ts = _utc_iso(m.get("timestamp") or m.get("time") or base_ts)
             if metric is None or value is None:
                 continue
             if str(value).count("/") == 1 and ("bp" in str(metric).lower() or metric == "blood_pressure"):
@@ -166,11 +163,11 @@ def _normalize_one(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
             else:
                 rows.append({
                     "timestamp_utc": m_ts, "patient_id": str(patient_id),
-                    "metric": str(metric).strip().lower(), "value": value, "unit": str(unit), "source": "tenovi",
+                    "metric": str(metric).lower().strip(), "value": value, "unit": str(unit), "source": "tenovi",
                 })
     return rows
 
-# ── Root & health ─────────────────────────────────────────────────────────
+# ── Root / health ────────────────────────────────────────────────────────
 @app.get("/")
 def root() -> Dict[str, Any]:
     return {"ok": True, "service": APP_NAME}
@@ -179,10 +176,10 @@ def root() -> Dict[str, Any]:
 def health() -> Dict[str, str]:
     return {"status": "ok"}
 
-# ── Demo patients ─────────────────────────────────────────────────────────
+# ── Demo patients and optional Tenovi patients proxy ─────────────────────
 MOCK_PATIENTS: List[Dict[str, Any]] = [
-    {"id": "todd",  "name": "Todd Gross", "age": 47, "gender": "Male"},
-    {"id": "jane",  "name": "Jane Wilson", "age": 53, "gender": "Female"},
+    {"id": "todd", "name": "Todd Carter", "age": 47, "gender": "Male"},
+    {"id": "jane", "name": "Jane Wilson", "age": 53, "gender": "Female"},
     {"id": "54321", "name": "Webhook Test", "age": 40, "gender": "—"},
 ]
 
@@ -206,7 +203,25 @@ def tenovi_patients(search: str = "", page: int = 1, page_size: int = 10):
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-# ── Tenovi webhook (plural + singular) ────────────────────────────────────
+# ── Debug helpers ────────────────────────────────────────────────────────
+def _save_last_payload(raw_bytes: bytes):
+    p = _ensure_parent_dir(DEBUG_LAST_PAYLOAD)
+    try:
+        with open(p, "wb") as f:
+            f.write(raw_bytes)
+    except Exception:
+        pass
+
+@app.get("/debug/last-payload")
+def debug_last_payload():
+    p = _ensure_parent_dir(DEBUG_LAST_PAYLOAD)
+    try:
+        b = os.path.getsize(p)
+        return {"ok": True, "bytes": int(b)}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+# ── Tenovi webhook(s) ────────────────────────────────────────────────────
 def _ingest_payload_items(items: List[Dict[str, Any]]) -> int:
     inserted = 0
     for obj in items:
@@ -215,14 +230,12 @@ def _ingest_payload_items(items: List[Dict[str, Any]]) -> int:
             inserted += 1
     return inserted
 
-async def _tenovi_handler(
-    request: Request,
-    x_webhook_key: Optional[str] = Header(default=None, alias="X-Webhook-Key"),
-) -> Dict[str, Any]:
+async def _tenovi_handler(request: Request, x_webhook_key: Optional[str]) -> Dict[str, Any]:
     if TENOVI_EXPECTED_KEY and x_webhook_key != TENOVI_EXPECTED_KEY:
         raise HTTPException(status_code=401, detail="invalid webhook key")
 
     body = await request.body()
+    _save_last_payload(body)
     if not body.strip():
         return {"ok": True, "message": "empty webhook body (test acknowledged)"}
 
@@ -249,14 +262,14 @@ async def _tenovi_handler(
     return {"ok": True, "inserted": inserted}
 
 @app.post("/webhooks/tenovi")
-async def tenovi_webhook_plural(request: Request, x_webhook_key: Optional[str] = Header(default=None, alias="X-Webhook-Key")):
+async def tenovi_webhook_plural(request: Request, x_webhook_key: Optional[str] = Header(None, alias="X-Webhook-Key")):
     return await _tenovi_handler(request, x_webhook_key)
 
 @app.post("/webhook/tenovi")
-async def tenovi_webhook_singular(request: Request, x_webhook_key: Optional[str] = Header(default=None, alias="X-Webhook-Key")):
+async def tenovi_webhook_singular(request: Request, x_webhook_key: Optional[str] = Header(None, alias="X-Webhook-Key")):
     return await _tenovi_handler(request, x_webhook_key)
 
-# ── Synthetic vitals + serving recent webhook data ────────────────────────
+# ── Serve vitals (real recent webhook rows OR synthetic) ─────────────────
 def _seed_for_patient(pid: str) -> int:
     return sum(ord(c) for c in pid) % 7
 
@@ -304,10 +317,8 @@ def _recent_webhook_vitals(hours: int, patient_id: Optional[str]) -> List[Dict[s
         out.append({
             "timestamp_utc": dt.isoformat(),
             "metric": str(r.get("metric", "")).strip().lower(),
-            "value": r.get("value"),
-            "unit": r.get("unit", ""),
-            "source": r.get("source", "tenovi"),
-            "patient_id": r.get("patient_id"),
+            "value": r.get("value"), "unit": r.get("unit", ""),
+            "source": r.get("source", "tenovi"), "patient_id": r.get("patient_id"),
         })
     return out
 

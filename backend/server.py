@@ -181,7 +181,7 @@ def health() -> Dict[str, str]:
 
 # ── Demo patients ─────────────────────────────────────────────────────────
 MOCK_PATIENTS: List[Dict[str, Any]] = [
-    {"id": "todd",  "name": "Todd Carter", "age": 47, "gender": "Male"},
+    {"id": "todd",  "name": "Todd Gross", "age": 47, "gender": "Male"},
     {"id": "jane",  "name": "Jane Wilson", "age": 53, "gender": "Female"},
     {"id": "54321", "name": "Webhook Test", "age": 40, "gender": "—"},
 ]

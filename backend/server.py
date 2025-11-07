@@ -195,6 +195,7 @@ def _normalize_one(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "value": value, "unit": str(unit), "source": "tenovi",
             })
 
+    
     # measurements: [...]
     if isinstance(payload.get("measurements"), list):
         for m in payload["measurements"]:
@@ -204,6 +205,8 @@ def _normalize_one(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
             m_ts = _utc_iso(m.get("timestamp") or m.get("time") or base_ts)
             if metric is None or value is None:
                 continue
+
+            # Handle BP like "122/79"
             if str(value).count("/") == 1 and ("bp" in str(metric).lower() or metric == "blood_pressure"):
                 for r in _split_bp(str(value)):
                     rows.append({
@@ -211,10 +214,15 @@ def _normalize_one(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
                         "metric": r["metric"], "value": r["value"], "unit": r.get("unit", ""), "source": "tenovi",
                     })
             else:
+                # Handle weight or other numeric fields
+                try:
+                    numeric_val = float(value)
+                except Exception:
+                    numeric_val = value
                 rows.append({
                     "timestamp_utc": m_ts, "patient_id": str(patient_id),
                     "metric": str(metric).strip().lower(),
-                    "value": value, "unit": str(unit), "source": "tenovi",
+                    "value": numeric_val, "unit": str(unit), "source": "tenovi",
                 })
     return rows
 

@@ -20,7 +20,10 @@ TENOVI_API_KEY = os.getenv("TENOVI_API_KEY")  # optional, for /tenovi/patients
 DATA_FILE = os.getenv("VITALS_JSONL_PATH", "/data/vitals.jsonl")
 SEEN_FILE = os.getenv("VITALS_SEEN_PATH", "/data/seen_ids.jsonl")
 
-app = FastAPI(title="Quantaira Backend", version="1.4.0")
+# where to stash last raw webhook body for debugging
+DEBUG_LAST_PAYLOAD = os.getenv("DEBUG_LAST_PAYLOAD", "/tmp/last_tenovi_payload.json")
+
+app = FastAPI(title="Quantaira Backend", version="1.5.0")
 
 # ── CORS (allow Streamlit UI) ─────────────────────────────────────────────
 app.add_middleware(
@@ -108,8 +111,45 @@ def _split_bp(val: str) -> List[Dict[str, Any]]:
     except Exception:
         return [{"metric": "blood_pressure", "value": str(val), "unit": ""}]
 
+# ── Root & health ─────────────────────────────────────────────────────────
+@app.get("/")
+def root() -> Dict[str, Any]:
+    return {"ok": True, "service": APP_NAME}
+
+@app.get("/health")
+def health() -> Dict[str, str]:
+    return {"status": "ok"}
+
+# ── Demo patients ─────────────────────────────────────────────────────────
+MOCK_PATIENTS: List[Dict[str, Any]] = [
+    {"id": "todd", "name": "Todd Carter", "age": 47, "gender": "Male"},
+    {"id": "jane", "name": "Jane Wilson", "age": 53, "gender": "Female"},
+    {"id": "alex", "name": "Alex Kim", "age": 29, "gender": "Male"},
+]
+
+@app.get("/patients")
+def get_patients() -> List[Dict[str, Any]]:
+    return MOCK_PATIENTS
+
+# Optional: proxy to Tenovi patient API if TENOVI_API_KEY is set
+@app.get("/tenovi/patients")
+def tenovi_patients(search: str = "", page: int = 1, page_size: int = 10):
+    if not TENOVI_API_KEY:
+        return {"ok": False, "error": "TENOVI_API_KEY not set"}
+    try:
+        r = requests.get(
+            "https://api2.tenovi.com/hwi-patients/",
+            headers={"Authorization": f"Api-Key {TENOVI_API_KEY}"},
+            params={"search": search, "page": page, "page_size": page_size},
+            timeout=20,
+        )
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+# ── Normalization ─────────────────────────────────────────────────────────
 def _normalize_one(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Normalize one Tenovi-like object into rows our frontend understands."""
     rows: List[Dict[str, Any]] = []
     patient_id = (
         payload.get("patient_id")
@@ -178,40 +218,21 @@ def _normalize_one(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
                 })
     return rows
 
-# ── Root & health ─────────────────────────────────────────────────────────
-@app.get("/")
-def root() -> Dict[str, Any]:
-    return {"ok": True, "service": APP_NAME}
-
-@app.get("/health")
-def health() -> Dict[str, str]:
-    return {"status": "ok"}
-
-# ── Demo patients ─────────────────────────────────────────────────────────
-MOCK_PATIENTS: List[Dict[str, Any]] = [
-    {"id": "todd", "name": "Todd Carter", "age": 47, "gender": "Male"},
-    {"id": "jane", "name": "Jane Wilson", "age": 53, "gender": "Female"},
-    {"id": "alex", "name": "Alex Kim", "age": 29, "gender": "Male"},
-]
-
-@app.get("/patients")
-def get_patients() -> List[Dict[str, Any]]:
-    return MOCK_PATIENTS
-
-# Optional: proxy to Tenovi patient API if TENOVI_API_KEY is set
-@app.get("/tenovi/patients")
-def tenovi_patients(search: str = "", page: int = 1, page_size: int = 10):
-    if not TENOVI_API_KEY:
-        return {"ok": False, "error": "TENOVI_API_KEY not set"}
+# ── Debug black-box for raw webhook body ──────────────────────────────────
+def _save_last_payload(raw_bytes: bytes):
     try:
-        r = requests.get(
-            "https://api2.tenovi.com/hwi-patients/",
-            headers={"Authorization": f"Api-Key {TENOVI_API_KEY}"},
-            params={"search": search, "page": page, "page_size": page_size},
-            timeout=20,
-        )
-        r.raise_for_status()
-        return r.json()
+        with open(_ensure_parent_dir(DEBUG_LAST_PAYLOAD), "wb") as f:
+            f.write(raw_bytes)
+    except Exception:
+        pass
+
+@app.get("/debug/last-payload")
+def get_last_payload():
+    try:
+        path = _ensure_parent_dir(DEBUG_LAST_PAYLOAD)
+        with open(path, "rb") as f:
+            b = f.read()
+        return {"ok": True, "bytes": len(b)}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -224,6 +245,19 @@ def _ingest_payload_items(items: List[Dict[str, Any]]) -> int:
             inserted += 1
     return inserted
 
+def _to_items(p: Any) -> List[Dict[str, Any]]:
+    """Accept common Tenovi/test shapes: list, dict w/ items|measurements|data|results, or single measurement."""
+    if isinstance(p, list):
+        return [x for x in p if isinstance(x, dict)]
+    if isinstance(p, dict):
+        for key in ("items", "measurements", "data", "results"):
+            if isinstance(p.get(key), list):
+                return [x for x in p[key] if isinstance(x, dict)]
+        if isinstance(p.get("measurement"), dict):
+            return [p["measurement"]]
+        return [p]
+    return []
+
 async def _tenovi_handler(
     request: Request,
     x_webhook_key: Optional[str] = Header(default=None, alias="X-Webhook-Key"),
@@ -232,8 +266,11 @@ async def _tenovi_handler(
     if TENOVI_EXPECTED_KEY and x_webhook_key != TENOVI_EXPECTED_KEY:
         raise HTTPException(status_code=401, detail="invalid webhook key")
 
-    # 2) read body; acknowledge empty test payloads
+    # 2) raw body → debug black-box
     body = await request.body()
+    _save_last_payload(body)
+
+    # Acknowledge empty tests
     if not body.strip():
         return {"ok": True, "message": "empty webhook body (test acknowledged)"}
 
@@ -243,22 +280,16 @@ async def _tenovi_handler(
         return {"ok": True, "duplicate": True}
     _mark_seen(eid)
 
-    # 4) parse JSON and ingest
+    # 4) parse and ingest
     try:
-        payload: Union[List[Dict[str, Any]], Dict[str, Any]] = await request.json()
+        payload: Any = await request.json()
     except Exception:
         return {"ok": False, "error": "invalid JSON"}
 
-    if isinstance(payload, list):
-        items = [p for p in payload if isinstance(p, dict)]
-        if not items:
-            return {"ok": True, "message": "empty array (no measurements)"}
-        inserted = _ingest_payload_items(items)
-    elif isinstance(payload, dict):
-        inserted = _ingest_payload_items([payload])
-    else:
-        return {"ok": False, "error": f"unsupported payload type {type(payload)}"}
-
+    items = _to_items(payload)
+    if not items:
+        return {"ok": True, "message": "no measurement objects found"}
+    inserted = _ingest_payload_items(items)
     return {"ok": True, "inserted": inserted}
 
 @app.post("/webhooks/tenovi")

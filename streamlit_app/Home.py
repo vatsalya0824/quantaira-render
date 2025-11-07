@@ -1,30 +1,38 @@
 # streamlit_app/Home.py
-from __future__ import annotations
 import streamlit as st
 import pandas as pd
+
 from fetcher import fetch_patients, backend_health
 
 st.set_page_config(page_title="Quantaira Dashboard", layout="wide")
 
-st.title("Quantaira Dashboard")
-health = backend_health()
-st.caption(f"Backend: {health.get('base_url')} — ok={health.get('ok')}")
+st.markdown("# Quantaira Dashboard")
 
-df = fetch_patients()
-if df.empty:
-    st.info("No patients returned by backend.")
-    st.stop()
+bh = backend_health()
+if bh.get("ok"):
+    st.caption(f"Backend: [{bh['base_url']}]({bh['base_url']}) — ok=True")
+else:
+    st.caption(f"Backend: {bh.get('base_url','?')} — ok=False")
 
-st.subheader("Patients")
-for _, r in df.iterrows():
-    pid = str(r.get("id", ""))
-    name = str(r.get("name", pid))
-    col1, col2 = st.columns([6, 1])
-    with col1:
-        st.write(f"**{name}**  \n_id: {pid}_")
-    with col2:
-        if st.button("Open", key=f"open_{pid}"):
-            # WRITE query params with the new API (no experimental calls)
-            st.query_params.update({"pid": pid, "name": name})
-            # jump to the patient page
-            st.switch_page("pages/Patient.py")
+patients = fetch_patients()
+if patients.empty:
+    st.info("No patients found.")
+else:
+    st.markdown("## Patients ↪️")
+
+    def go_patient(pid: str, name: str):
+        # Use ONLY modern API to avoid deprecation conflicts
+        st.query_params["pid"] = pid
+        st.query_params["name"] = name
+        st.switch_page("pages/Patient.py")
+
+    for _, row in patients.iterrows():
+        name = str(row.get("name", "Patient"))
+        pid  = str(row.get("id",  "unknown"))
+        with st.container(border=True):
+            left, right = st.columns([6,1])
+            with left:
+                st.markdown(f"**{name}**\n\n*id: {pid}*")
+            with right:
+                if st.button("Open", key=f"open_{pid}"):
+                    go_patient(pid, name)

@@ -15,7 +15,7 @@ import streamlit as st
 from streamlit.components.v1 import html as st_html
 import requests
 
-# ⬇️ Correct import: use fetch_vitals (not fetch_data)
+# ⬇️ Correct import: use fetch_data (NOT fetch_vitals)
 from fetcher import fetch_data
 import common
 common = reload(common)
@@ -25,7 +25,7 @@ from common import best_ts_col, convert_tz, split_blood_pressure
 # Page config
 # ─────────────────────────────────────────────
 st.set_page_config(page_title="Patient Detail", layout="wide")
-BUILD_TAG = "patient-ios-teal v6 (UTC markers + persistence)"
+BUILD_TAG = "patient-ios-teal v6.1 (UTC markers + persistence + int64 fix)"
 st.markdown(
     f"<div style='opacity:.45;font:12px/1.2 ui-sans-serif,system-ui'>build {BUILD_TAG}</div>",
     unsafe_allow_html=True,
@@ -105,8 +105,9 @@ def _get_param(key: str, default: str):
         pass
     return st.session_state.get(key, default)
 
-pid  = str(_get_param("pid", "todd"))
-name = str(_get_param("name", "Patient"))
+# ✅ default to Todd so the page immediately loads real data
+pid  = str(_get_param("pid", "54321"))
+name = str(_get_param("name", "Todd Gross"))
 if "win" not in st.session_state: st.session_state.win = "24h"
 if "metric_sel" not in st.session_state: st.session_state.metric_sel = "pulse"
 HOURS_LOOKUP = {"24h":24, "3d":72, "7d":7*24, "30d":30*24}
@@ -291,7 +292,8 @@ def get_limits_for_mode(mode: str, pid: str, metric: str, values: pd.Series):
 def nearest_indices_utc(x_ts, event_ts_list):
     """x_ts is local tz-aware; events are UTC. Normalize both to UTC int64 and match."""
     if not x_ts or not event_ts_list: return []
-    x_utc = pd.to_datetime(pd.Series(x_ts), errors="coerce").dt.tz_convert("UTC").view("int64").values
+    # ✅ FutureWarning fix: use astype('int64') instead of .view('int64')
+    x_utc = pd.to_datetime(pd.Series(x_ts), errors="coerce").dt.tz_convert("UTC").astype("int64").values
     out = []
     for e in event_ts_list:
         e_i64 = pd.Timestamp(e).tz_convert("UTC").value

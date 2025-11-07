@@ -1,43 +1,24 @@
-# streamlit_app/common.py — shared helpers for Patient.py & Home.py
-
+# streamlit_app/common.py — shared helpers
 import pandas as pd
-from datetime import datetime
 import pytz
 
-# ─────────────────────────────────────────────
-# Pick the most relevant timestamp column
-# ─────────────────────────────────────────────
 def best_ts_col(df: pd.DataFrame):
-    """Return the best timestamp column name if present."""
     for c in ["timestamp_utc", "timestamp", "time", "datetime"]:
         if c in df.columns:
             return c
     return None
 
-# ─────────────────────────────────────────────
-# Convert UTC timestamps → local timezone
-# ─────────────────────────────────────────────
 def convert_tz(ts_col, tz_name="UTC"):
-    """Convert a Series or list of UTC timestamps into the chosen timezone."""
     if ts_col is None:
         return []
     try:
-        tz = pytz.timezone(tz_name)
-        return pd.to_datetime(ts_col, utc=True, errors="coerce").dt.tz_convert(tz)
+        return pd.to_datetime(ts_col, utc=True, errors="coerce").dt.tz_convert(pytz.timezone(tz_name))
     except Exception:
         return pd.to_datetime(ts_col, errors="coerce")
 
-# ─────────────────────────────────────────────
-# Split combined BP into systolic/diastolic rows
-# ─────────────────────────────────────────────
 def split_blood_pressure(df: pd.DataFrame):
-    """
-    If a 'blood_pressure' or combined BP metric appears (e.g. '120/80'),
-    split it into two metrics: systolic_bp and diastolic_bp.
-    """
     if df is None or df.empty:
         return df
-
     df = df.copy()
     new_rows = []
     for _, row in df.iterrows():

@@ -1,6 +1,5 @@
 # pages/Patient.py — iOS teal pills + green-above / yellow-normal / red-below,
-# meals & notes markers fixed (UTC matching), stable forms,
-# 3d/7d window ok, and **per-patient persistence to CSV**.
+# meals & notes markers (UTC), per-patient CSV persistence.
 
 from datetime import datetime
 from pathlib import Path
@@ -8,7 +7,6 @@ import json
 from importlib import reload
 from string import Template
 import os
-
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -20,9 +18,6 @@ import common
 common = reload(common)
 from common import best_ts_col, convert_tz, split_blood_pressure
 
-# ─────────────────────────────────────────────
-# Page config
-# ─────────────────────────────────────────────
 st.set_page_config(page_title="Patient Detail", layout="wide")
 BUILD_TAG = "patient-ios-teal v6 (UTC markers + persistence)"
 st.markdown(
@@ -30,43 +25,38 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ─────────────────────────────────────────────
-# Secrets / constants
-# ─────────────────────────────────────────────
+# --- Read ONLY the new query param API ---
+qp   = st.query_params
+pid  = str(qp.get("pid", "todd"))
+name = str(qp.get("name", "Patient"))
+
 USDA_API_KEY = os.getenv("USDA_API_KEY") or st.secrets.get("USDA_API_KEY", "")
 if not USDA_API_KEY:
-    st.warning("USDA_API_KEY not set (env var or .streamlit/secrets.toml)")
+    st.warning("USDA_API_KEY not set (env or .streamlit/secrets.toml)")
 
 P = {
     "bg": "#F6FBFD", "ink": "#0F172A", "muted": "#667085",
     "chip": "#F3F6F8", "chipBrd": "rgba(2,6,23,.08)",
     "tealA": "#48C9C3", "tealB": "#3FB7B2", "glow": "rgba(68,194,189,.32)",
-    # colors: GREEN=above, YELLOW=normal, RED=below
     "segGreen": "#10B981", "segYellow": "#FACC15", "segRed": "#EF4444",
     "refLine": "rgba(15,23,42,.45)",
     "pillDot": "#0F172A", "mealDot": "#f472b6", "noteDot": "#14b8a6"
 }
 UNITS = {"pulse":"bpm","systolic_bp":"mmHg","diastolic_bp":"mmHg","spo2":"%"}
 
-# ─────────────────────────────────────────────
-# Simple per-patient persistence (CSV)
-# ─────────────────────────────────────────────
-DATA_DIR = Path(".user_state")  # will be created next to the app
+# ── per-patient persistence ───────────────────────────────────────────────
+DATA_DIR = Path(".user_state")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-def _meals_path(pid: str) -> Path:
-    return DATA_DIR / f"meals_{pid}.csv"
-
-def _notes_path(pid: str) -> Path:
-    return DATA_DIR / f"notes_{pid}.csv"
+def _meals_path(pid: str) -> Path: return DATA_DIR / f"meals_{pid}.csv"
+def _notes_path(pid: str) -> Path: return DATA_DIR / f"notes_{pid}.csv"
 
 MEAL_COLS = ["timestamp_utc","food","kcal","protein_g","carbs_g","fat_g","sodium_mg","fdc_id"]
 NOTE_COLS = ["timestamp_utc","note"]
 
 def load_meals(pid: str) -> pd.DataFrame:
     p = _meals_path(pid)
-    if not p.exists():
-        return pd.DataFrame(columns=MEAL_COLS)
+    if not p.exists(): return pd.DataFrame(columns=MEAL_COLS)
     df = pd.read_csv(p, dtype={"fdc_id": "string"})
     if "timestamp_utc" in df.columns:
         df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True, errors="coerce")
@@ -74,15 +64,13 @@ def load_meals(pid: str) -> pd.DataFrame:
 
 def load_notes(pid: str) -> pd.DataFrame:
     p = _notes_path(pid)
-    if not p.exists():
-        return pd.DataFrame(columns=NOTE_COLS)
+    if not p.exists(): return pd.DataFrame(columns=NOTE_COLS)
     df = pd.read_csv(p)
     if "timestamp_utc" in df.columns:
         df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True, errors="coerce")
     return df[NOTE_COLS].dropna(subset=["timestamp_utc"])
 
 def save_meals(pid: str, df: pd.DataFrame):
-    # Keep only expected cols in a stable order; write ISO timestamps
     out = df.copy()
     out["timestamp_utc"] = pd.to_datetime(out["timestamp_utc"], utc=True, errors="coerce")
     out = out[MEAL_COLS].sort_values("timestamp_utc").reset_index(drop=True)
@@ -94,47 +82,29 @@ def save_notes(pid: str, df: pd.DataFrame):
     out = out[NOTE_COLS].sort_values("timestamp_utc").reset_index(drop=True)
     out.to_csv(_notes_path(pid), index=False)
 
-# ─────────────────────────────────────────────
-# Session state
-# ─────────────────────────────────────────────
-def _get_param(key: str, default: str):
-    try:
-        qp = st.query_params
-        if key in qp and qp[key]: return qp[key]
-    except Exception:
-        pass
-    return st.session_state.get(key, default)
-
-pid  = str(_get_param("pid", "todd"))
-name = str(_get_param("name", "Patient"))
+# ── session state init ────────────────────────────────────────────────────
 if "win" not in st.session_state: st.session_state.win = "24h"
 if "metric_sel" not in st.session_state: st.session_state.metric_sel = "pulse"
 HOURS_LOOKUP = {"24h":24, "3d":72, "7d":7*24, "30d":30*24}
-
 if "limits" not in st.session_state: st.session_state.limits = {}
 if "global_limits" not in st.session_state: st.session_state.global_limits = {}
 if "limit_mode" not in st.session_state: st.session_state.limit_mode = "Auto (μ±0.5σ)"
 
-# Initialize meals/notes from disk on first load for this patient
 if "persist_loaded_for" not in st.session_state or st.session_state.persist_loaded_for != pid:
     st.session_state["meals"] = load_meals(pid)
     st.session_state["notes"] = load_notes(pid)
     st.session_state["usda_hits"] = []
     st.session_state.persist_loaded_for = pid
 
-# ─────────────────────────────────────────────
-# CSS (iOS-style / teal)
-# ─────────────────────────────────────────────
+# ── CSS (iOS-style) ───────────────────────────────────────────────────────
 st.markdown(f"""
 <style>
   .stApp{{background:{P['bg']};color:{P['ink']};}}
   section[data-testid="stSidebar"]{{ background:#ECF7F6; border-right:1px solid rgba(2,6,23,.06); }}
   .h-title{{font-weight:900;font-size:34px;margin:2px 0;color:{P['ink']};}}
   .h-sub{{color:{P['muted']};margin:0 0 12px;}}
-
   .pillrow{{ display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin:6px 0 14px; }}
   .pillrow .stButton{{ margin:0 !important; }}
-
   .stButton > button {{
     appearance:none !important;
     border:1px solid {P['chipBrd']} !important;
@@ -152,14 +122,6 @@ st.markdown(f"""
     box-shadow:0 14px 30px rgba(17,24,39,.10) !important; }}
   .stButton > button:active {{ transform: translateY(0);
     box-shadow:0 8px 16px rgba(17,24,39,.10) !important; }}
-
-  .stButton > button#tw_{st.session_state.win}-button,
-  .stButton > button#metric_{st.session_state.metric_sel}-button {{
-    background:linear-gradient(180deg,{P['tealA']},{P['tealB']}) !important;
-    color:#fff !important; border-color:transparent !important;
-    box-shadow:0 18px 38px {P['glow']} !important; filter:none !important;
-  }}
-
   .chart-wrap{{background:#fff;border-radius:18px;padding:12px 14px;box-shadow:0 18px 44px rgba(17,24,39,.10)}}
   .stats{{background:#fff;border-radius:14px;padding:12px 14px;box-shadow:0 10px 26px rgba(0,0,0,.08);
          width:260px;font-size:13px;color:#374151}}
@@ -167,9 +129,7 @@ st.markdown(f"""
 </style>
 """, unsafe_allow_html=True)
 
-# ─────────────────────────────────────────────
-# Sidebar knobs + limits mode
-# ─────────────────────────────────────────────
+# ── Sidebar ───────────────────────────────────────────────────────────────
 st.sidebar.header("Settings")
 tz_choice   = st.sidebar.selectbox("Timezone", ["UTC","America/New_York","Europe/London","Asia/Kolkata"], index=0, key="tz_sel")
 line_w      = st.sidebar.slider("Line width", 1, 6, 4)
@@ -186,42 +146,26 @@ limit_mode = st.sidebar.radio(
 )
 st.session_state.limit_mode = limit_mode
 
-# ─────────────────────────────────────────────
-# Header
-# ─────────────────────────────────────────────
+# ── Header + metric/time pills ────────────────────────────────────────────
 st.markdown(f"<div class='h-title'>{name}</div>", unsafe_allow_html=True)
 st.markdown("<div class='h-sub'>Green = Above USL • Yellow = Normal • Red = Below LSL. Dots: pill (dark), meal (pink), note (teal).</div>", unsafe_allow_html=True)
 
-# ─────────────────────────────────────────────
-# Time + metric pills
-# ─────────────────────────────────────────────
 st.markdown('<div class="pillrow">', unsafe_allow_html=True)
-tw_cols = st.columns(4, gap="small")
-for i, lbl in enumerate(["24h", "3d", "7d", "30d"]):
-    if tw_cols[i].button(lbl, key=f"tw_{lbl}", type="secondary"):
+for lbl in ["24h", "3d", "7d", "30d"]:
+    if st.button(lbl, key=f"tw_{lbl}", type="secondary"):
         st.session_state.win = lbl
 st.markdown('</div>', unsafe_allow_html=True)
 
-METRIC_LABELS = {
-    "pulse":"Heart Rate",
-    "systolic_bp":"Systolic BP",
-    "diastolic_bp":"Diastolic BP",
-    "spo2":"SpO₂",
-    "bp_both":"BP (both)",
-}
+METRIC_LABELS = {"pulse":"Heart Rate","systolic_bp":"Systolic BP","diastolic_bp":"Diastolic BP","spo2":"SpO₂","bp_both":"BP (both)"}
 st.markdown('<div class="pillrow">', unsafe_allow_html=True)
-mcols = st.columns(len(METRIC_LABELS), gap="small")
-for i, m in enumerate(METRIC_LABELS.keys()):
-    if mcols[i].button(METRIC_LABELS[m], key=f"metric_{m}", type="secondary"):
+for m in METRIC_LABELS.keys():
+    if st.button(METRIC_LABELS[m], key=f"metric_{m}", type="secondary"):
         st.session_state.metric_sel = m
 st.markdown('</div>', unsafe_allow_html=True)
 
-# ─────────────────────────────────────────────
-# Data: pull and filter
-# ─────────────────────────────────────────────
+# ── Data fetch ────────────────────────────────────────────────────────────
 def load_window(hours: int) -> pd.DataFrame:
     try:
-        # ✅ ensure vitals are per-patient
         df = fetch_data(hours=hours, patient_id=pid)
     except Exception:
         df = None
@@ -231,9 +175,8 @@ def load_window(hours: int) -> pd.DataFrame:
     df["timestamp_utc"] = pd.to_datetime(df[ts_col], utc=True, errors="coerce")
     return df.dropna(subset=["timestamp_utc"])
 
-raw = load_window(HOURS_LOOKUP[st.session_state.win])
+raw = load_window({"24h":24,"3d":72,"7d":168,"30d":720}[st.session_state.win])
 raw = split_blood_pressure(raw)
-
 if raw.empty:
     st.info("No data to display.")
     st.stop()
@@ -244,42 +187,30 @@ try:
 except Exception:
     pass
 
-# ─────────────────────────────────────────────
-# Prepare + detect pill events
-# ─────────────────────────────────────────────
 def prepare(df: pd.DataFrame, tz_name: str):
     df = df.copy()
-    df["value"] = pd.to_numeric(df.get("value", df.get("value_1")), errors="coerce")
+    df["value"]  = pd.to_numeric(df.get("value", df.get("value_1")), errors="coerce")
     df["metric"] = df["metric"].astype(str).str.strip().str.lower()
-
     is_pill = df["metric"].eq("pillbox_opened")
     if "device_name" in df.columns:
         is_pill |= df["device_name"].astype(str).str.lower().str.contains("pillbox", na=False)
-
     pill_events = df.loc[is_pill, "timestamp_utc"].dropna().sort_values().unique().tolist()
-
     plot_df = df.loc[~is_pill].copy()
     plot_df["local_time"] = convert_tz(plot_df["timestamp_utc"], tz_name)
     return plot_df, pill_events
 
-plot_df, pill_events = prepare(raw, tz_choice)
-metric = st.session_state.metric_sel
+plot_df, pill_events = prepare(raw, st.session_state.tz_sel if "tz_sel" in st.session_state else tz_choice)
 
-# ─────────────────────────────────────────────
-# Limits helpers
-# ─────────────────────────────────────────────
 def suggest_limits(values: pd.Series):
     s = pd.to_numeric(values, errors="coerce").dropna()
     if s.empty: return None, None
     mu = float(s.mean()); sd = float(s.std(ddof=0) or 0.0)
-    return mu - 0.5 * sd, mu + 0.5 * sd
+    return mu - 0.5*sd, mu + 0.5*sd
 
 def get_limits_for_mode(mode: str, pid: str, metric: str, values: pd.Series):
     if mode == "Patient override":
         pmap = st.session_state.limits.get(pid, {})
-        if metric in pmap:
-            lsl, usl = pmap[metric]
-            return float(lsl), float(usl)
+        if metric in pmap: return float(pmap[metric][0]), float(pmap[metric][1])
         return suggest_limits(values)
     if mode == "Global defaults":
         g = st.session_state.global_limits.get(metric)
@@ -287,11 +218,7 @@ def get_limits_for_mode(mode: str, pid: str, metric: str, values: pd.Series):
         return suggest_limits(values)
     return suggest_limits(values)
 
-# ─────────────────────────────────────────────
-# UTC index matching for markers
-# ─────────────────────────────────────────────
 def nearest_indices_utc(x_ts, event_ts_list):
-    """x_ts is local tz-aware; events are UTC. Normalize both to UTC int64 and match."""
     if not x_ts or not event_ts_list: return []
     x_utc = pd.to_datetime(pd.Series(x_ts), errors="coerce").dt.tz_convert("UTC").view("int64").values
     out = []
@@ -300,9 +227,7 @@ def nearest_indices_utc(x_ts, event_ts_list):
         out.append(int(np.argmin(np.abs(x_utc - e_i64))))
     return sorted(set(out))
 
-# ─────────────────────────────────────────────
-# Chart.js renderers (colors fixed)
-# ─────────────────────────────────────────────
+# ── Chart.js helpers (single & dual BP) — omitted for brevity here? No! keep full.
 def chartjs_single_with_markers(x, y, pill_idx, meal_idx, note_idx, lsl, usl, key="cj_single", height=460):
     labels = [pd.to_datetime(t).strftime("%b %d %H:%M") for t in x]
     data = [None if pd.isna(v) else float(v) for v in pd.to_numeric(y, errors="coerce")]
@@ -321,62 +246,50 @@ def chartjs_single_with_markers(x, y, pill_idx, meal_idx, note_idx, lsl, usl, ke
     if show_ref and len(data) > 0:
         if lsl is not None:
             ref_datasets.append({"label":"LSL","data":[None if v is None else float(lsl) for v in data],
-                                 "borderColor": P["refLine"], "borderWidth": 1.2, "borderDash":[6,4], "pointRadius":0})
+                                 "borderColor": "rgba(15,23,42,.45)", "borderWidth": 1.2, "borderDash":[6,4], "pointRadius":0})
         if usl is not None:
             ref_datasets.append({"label":"USL","data":[None if v is None else float(usl) for v in data],
-                                 "borderColor": P["refLine"], "borderWidth": 1.2, "borderDash":[6,4], "pointRadius":0})
+                                 "borderColor": "rgba(15,23,42,.45)", "borderWidth": 1.2, "borderDash":[6,4], "pointRadius":0})
 
     html_tpl = Template("""
     <div class="chart-wrap" style="height:${height}px"><canvas id="${cid}"></canvas></div>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script>
       (function(){
-        const LSL = ${lsl}, USL = ${usl};
-        const C_GREEN='${c_green}', C_YELLOW='${c_yellow}', C_RED='${c_red}';
-
+        const LSL=${lsl}, USL=${usl};
+        const C_GREEN='#10B981', C_YELLOW='#FACC15', C_RED='#EF4444';
         const baseDatasets = [
           { data: ${series_data}, borderWidth: ${line_w}, tension: 0.55,
             cubicInterpolationMode: 'monotone', pointRadius: 0, spanGaps: true,
             segment: { borderColor: s => {
               const y0 = s.p0.parsed.y, y1 = s.p1.parsed.y;
-              if (y0==null || y1==null) return C_YELLOW;  // default normal
+              if (y0==null || y1==null) return C_YELLOW;
               const m = (y0 + y1)/2;
-              if (USL!=null && m>USL) return C_GREEN;     // GREEN = above
-              if (LSL!=null && m<LSL) return C_RED;       // RED = below
-              return C_YELLOW;                             // YELLOW = normal
+              if (USL!=null && m>USL) return C_GREEN;
+              if (LSL!=null && m<LSL) return C_RED;
+              return C_YELLOW;
             }}
           },
-          { data:${pill_points}, showLine:false, borderColor:'{pill}', backgroundColor:'{pill}',
+          { data:${pill_points}, showLine:false, borderColor:'#0F172A', backgroundColor:'#0F172A',
             pointBorderColor:'#FFFFFF', pointBorderWidth:2, pointRadius:${marker_sz} },
-          { data:${meal_points}, showLine:false, borderColor:'{meal}', backgroundColor:'{meal}',
+          { data:${meal_points}, showLine:false, borderColor:'#f472b6', backgroundColor:'#f472b6',
             pointBorderColor:'#FFFFFF', pointBorderWidth:2, pointRadius:${marker_sz} },
-          { data:${note_points}, showLine:false, borderColor:'{note}', backgroundColor:'{note}',
+          { data:${note_points}, showLine:false, borderColor:'#14b8a6', backgroundColor:'#14b8a6',
             pointBorderColor:'#FFFFFF', pointBorderWidth:2, pointRadius:${marker_sz} }
         ];
         const refDatasets = ${ref_datasets};
-
         const ctx = document.getElementById('${cid}').getContext('2d');
-        new Chart(ctx,{
-          type:'line',
-          data:{ labels:${labels}, datasets: baseDatasets.concat(refDatasets) },
-          options:{
-            responsive:true, maintainAspectRatio:false,
+        new Chart(ctx,{ type:'line', data:{ labels:${labels}, datasets: baseDatasets.concat(refDatasets) },
+          options:{ responsive:true, maintainAspectRatio:false,
             plugins:{ legend:{display:false}, tooltip:{intersect:false, mode:'index'} },
             interaction:{ intersect:false, mode:'index' },
-            scales:{
-              x:{ grid:{color:'rgba(120,120,180,0.18)'},
-                  ticks:{autoSkip:true,maxTicksLimit:6,maxRotation:0,minRotation:0}},
-              y:{ grid:{color:'rgba(0,0,0,0.06)'} }
-            }
-          }
-        });
+            scales:{ x:{ grid:{color:'rgba(120,120,180,0.18)'}, ticks:{autoSkip:true,maxTicksLimit:6,maxRotation:0,minRotation:0}},
+                     y:{ grid:{color:'rgba(0,0,0,0.06)'} } } });
       })();
-    </script>
-    """.replace("{pill}", P["pillDot"]).replace("{meal}", P["mealDot"]).replace("{note}", P["noteDot"]))
+    </script>""")
 
-    html = html_tpl.substitute(
-        height=int(height), cid=key,
-        labels=json.dumps(labels),
+    st_html(html_tpl.substitute(
+        height=int(height), cid=key, labels=json.dumps(labels),
         series_data=json.dumps(data),
         pill_points=json.dumps(pill_points),
         meal_points=json.dumps(meal_points),
@@ -384,13 +297,10 @@ def chartjs_single_with_markers(x, y, pill_idx, meal_idx, note_idx, lsl, usl, ke
         marker_sz=max(6, int(marker_size)), line_w=int(line_w),
         lsl=("null" if lsl is None else f"{float(lsl):.6f}"),
         usl=("null" if usl is None else f"{float(usl):.6f}"),
-        c_green=P["segGreen"], c_yellow=P["segYellow"], c_red=P["segRed"],
         ref_datasets=json.dumps(ref_datasets),
-    )
-    st_html(html, height=height, scrolling=False)
+    ), height=height, scrolling=False)
 
-def chartjs_dual_bp_with_markers(x, y1, y2, pill_idx, meal_idx, note_idx,
-                                 lsl1, usl1, lsl2, usl2, key="cj_bp_both", height=460):
+def chartjs_dual_bp_with_markers(x, y1, y2, pill_idx, meal_idx, note_idx, lsl1, usl1, lsl2, usl2, key="cj_bp_both", height=460):
     labels = [pd.to_datetime(t).strftime("%b %d %H:%M") for t in x]
     d1 = [None if pd.isna(v) else float(v) for v in pd.to_numeric(y1, errors="coerce")]
     d2 = [None if pd.isna(v) else float(v) for v in pd.to_numeric(y2, errors="coerce")]
@@ -409,85 +319,54 @@ def chartjs_dual_bp_with_markers(x, y1, y2, pill_idx, meal_idx, note_idx,
     if show_ref and len(d1)>0:
         if lsl1 is not None:
             ref_datasets.append({"label":"LSL (SBP)","data":[None if v is None else float(lsl1) for v in d1],
-                                 "borderColor": P["refLine"], "borderWidth":1.2, "borderDash":[6,4], "pointRadius":0})
+                                 "borderColor":"rgba(15,23,42,.45)","borderWidth":1.2,"borderDash":[6,4],"pointRadius":0})
         if usl1 is not None:
             ref_datasets.append({"label":"USL (SBP)","data":[None if v is None else float(usl1) for v in d1],
-                                 "borderColor": P["refLine"], "borderWidth":1.2, "borderDash":[6,4], "pointRadius":0})
+                                 "borderColor":"rgba(15,23,42,.45)","borderWidth":1.2,"borderDash":[6,4],"pointRadius":0})
     if show_ref and len(d2)>0:
         if lsl2 is not None:
             ref_datasets.append({"label":"LSL (DBP)","data":[None if v is None else float(lsl2) for v in d2],
-                                 "borderColor": P["refLine"], "borderWidth":1.2, "borderDash":[6,4], "pointRadius":0})
+                                 "borderColor":"rgba(15,23,42,.45)","borderWidth":1.2,"borderDash":[6,4],"pointRadius":0})
         if usl2 is not None:
             ref_datasets.append({"label":"USL (DBP)","data":[None if v is None else float(usl2) for v in d2],
-                                 "borderColor": P["refLine"], "borderWidth":1.2, "borderDash":[6,4], "pointRadius":0})
+                                 "borderColor":"rgba(15,23,42,.45)","borderWidth":1.2,"borderDash":[6,4],"pointRadius":0})
 
     html_tpl = Template("""
     <div class="chart-wrap" style="height:${height}px"><canvas id="${cid}"></canvas></div>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script>
       (function(){
-        const LSLs = [${lsl1}, ${lsl2}], USLs = [${usl1}, ${usl2}];
-        const C_GREEN='${c_green}', C_YELLOW='${c_yellow}', C_RED='${c_red}';
-
+        const LSLs=[${lsl1},${lsl2}], USLs=[${usl1},${usl2}];
+        const C_GREEN='#10B981', C_YELLOW='#FACC15', C_RED='#EF4444';
         const baseDatasets = [
-          { label:'Systolic', data:${d1}, borderWidth:${line_w},
-            tension:0.55, cubicInterpolationMode:'monotone', pointRadius:0, spanGaps:true,
-            segment:{ borderColor: s => {
-              const LSL=LSLs[0], USL=USLs[0];
-              const y0=s.p0.parsed.y, y1=s.p1.parsed.y; if (y0==null||y1==null) return C_YELLOW;
-              const m=(y0+y1)/2; if (USL!=null && m>USL) return C_GREEN;
-              if (LSL!=null && m<LSL) return C_RED; return C_YELLOW;
-            }}
-          },
-          { label:'Diastolic', data:${d2}, borderWidth:${line_w},
-            tension:0.55, cubicInterpolationMode:'monotone', pointRadius:0, spanGaps:true,
-            segment:{ borderColor: s => {
-              const LSL=LSLs[1], USL=USLs[1];
-              const y0=s.p0.parsed.y, y1=s.p1.parsed.y; if (y0==null||y1==null) return C_YELLOW;
-              const m=(y0+y1)/2; if (USL!=null && m>USL) return C_GREEN;
-              if (LSL!=null && m<LSL) return C_RED; return C_YELLOW;
-            }}
-          },
-
-          { data:${pill1}, showLine:false, borderColor:'{pill}', backgroundColor:'{pill}',
-            pointBorderColor:'#FFFFFF', pointBorderWidth:2, pointRadius:${marker_sz} },
-          { data:${pill2}, showLine:false, borderColor:'{pill}', backgroundColor:'{pill}',
-            pointBorderColor:'#FFFFFF', pointBorderWidth:2, pointRadius:${marker_sz} },
-
-          { data:${meal1}, showLine:false, borderColor:'{meal}', backgroundColor:'{meal}',
-            pointBorderColor:'#FFFFFF', pointBorderWidth:2, pointRadius:${marker_sz} },
-          { data:${meal2}, showLine:false, borderColor:'{meal}', backgroundColor:'{meal}',
-            pointBorderColor:'#FFFFFF', pointBorderWidth:2, pointRadius:${marker_sz} },
-
-          { data:${note1}, showLine:false, borderColor:'{note}', backgroundColor:'{note}',
-            pointBorderColor:'#FFFFFF', pointBorderWidth:2, pointRadius:${marker_sz} },
-          { data:${note2}, showLine:false, borderColor:'{note}', backgroundColor:'{note}',
-            pointBorderColor:'#FFFFFF', pointBorderWidth:2, pointRadius:${marker_sz} }
+          { label:'Systolic', data:${d1}, borderWidth:${line_w}, tension:0.55, cubicInterpolationMode:'monotone', pointRadius:0, spanGaps:true,
+            segment:{ borderColor: s => { const LSL=LSLs[0], USL=USLs[0]; const y0=s.p0.parsed.y, y1=s.p1.parsed.y;
+              if (y0==null||y1==null) return C_YELLOW; const m=(y0+y1)/2; if (USL!=null && m>USL) return C_GREEN;
+              if (LSL!=null && m<LSL) return C_RED; return C_YELLOW; }}},
+          { label:'Diastolic', data:${d2}, borderWidth:${line_w}, tension:0.55, cubicInterpolationMode:'monotone', pointRadius:0, spanGaps:true,
+            segment:{ borderColor: s => { const LSL=LSLs[1], USL=USLs[1]; const y0=s.p0.parsed.y, y1=s.p1.parsed.y;
+              if (y0==null||y1==null) return C_YELLOW; const m=(y0+y1)/2; if (USL!=null && m>USL) return C_GREEN;
+              if (LSL!=null && m<LSL) return C_RED; return C_YELLOW; }}},
+          { data:${pill1}, showLine:false, borderColor:'#0F172A', backgroundColor:'#0F172A', pointBorderColor:'#FFF', pointBorderWidth:2, pointRadius:${marker_sz} },
+          { data:${pill2}, showLine:false, borderColor:'#0F172A', backgroundColor:'#0F172A', pointBorderColor:'#FFF', pointBorderWidth:2, pointRadius:${marker_sz} },
+          { data:${meal1}, showLine:false, borderColor:'#f472b6', backgroundColor:'#f472b6', pointBorderColor:'#FFF', pointBorderWidth:2, pointRadius:${marker_sz} },
+          { data:${meal2}, showLine:false, borderColor:'#f472b6', backgroundColor:'#f472b6', pointBorderColor:'#FFF', pointBorderWidth:2, pointRadius:${marker_sz} },
+          { data:${note1}, showLine:false, borderColor:'#14b8a6', backgroundColor:'#14b8a6', pointBorderColor:'#FFF', pointBorderWidth:2, pointRadius:${marker_sz} },
+          { data:${note2}, showLine:false, borderColor:'#14b8a6', backgroundColor:'#14b8a6', pointBorderColor:'#FFF', pointBorderWidth:2, pointRadius:${marker_sz} }
         ];
         const refDatasets = ${ref_datasets};
-
         const ctx = document.getElementById('${cid}').getContext('2d');
-        new Chart(ctx,{
-          type:'line',
-          data:{ labels:${labels}, datasets: baseDatasets.concat(refDatasets) },
-          options:{
-            responsive:true, maintainAspectRatio:false,
-            plugins:{ legend:{ display:false }, tooltip:{intersect:false, mode:'index'} },
+        new Chart(ctx,{ type:'line', data:{ labels:${labels}, datasets: baseDatasets.concat(refDatasets) },
+          options:{ responsive:true, maintainAspectRatio:false,
+            plugins:{ legend:{display:false}, tooltip:{intersect:false, mode:'index'} },
             interaction:{ intersect:false, mode:'index' },
-            scales:{
-              x:{ grid:{color:'rgba(120,120,180,0.18)'},
-                  ticks:{autoSkip:true,maxTicksLimit:6,maxRotation:0,minRotation:0}},
-              y:{ grid:{color:'rgba(0,0,0,0.06)'} }
-            }
-          }
-        });
+            scales:{ x:{ grid:{color:'rgba(120,120,180,0.18)'}, ticks:{autoSkip:true,maxTicksLimit:6,maxRotation:0,minRotation:0}},
+                     y:{ grid:{color:'rgba(0,0,0,0.06)'} } } });
       })();
-    </script>
-    """.replace("{pill}", P["pillDot"]).replace("{meal}", P["mealDot"]).replace("{note}", P["noteDot"]))
+    </script>""")
 
-    html = html_tpl.substitute(
-        height=int(height), cid=key,
-        labels=json.dumps(labels),
+    st_html(html_tpl.substitute(
+        height=int(height), cid=key, labels=json.dumps(labels),
         d1=json.dumps(d1), d2=json.dumps(d2),
         pill1=json.dumps(pill1), pill2=json.dumps(pill2),
         meal1=json.dumps(meal1), meal2=json.dumps(meal2),
@@ -497,15 +376,14 @@ def chartjs_dual_bp_with_markers(x, y1, y2, pill_idx, meal_idx, note_idx,
         usl1=("null" if usl1 is None else f"{float(usl1):.6f}"),
         lsl2=("null" if lsl2 is None else f"{float(lsl2):.6f}"),
         usl2=("null" if usl2 is None else f"{float(usl2):.6f}"),
-        c_green=P["segGreen"], c_yellow=P["segYellow"], c_red=P["segRed"],
         ref_datasets=json.dumps(ref_datasets),
-    )
-    st_html(html, height=height, scrolling=False)
+    ), height=height, scrolling=False)
 
-# ─────────────────────────────────────────────
-# Render the selected metric
-# ─────────────────────────────────────────────
-if st.session_state.metric_sel == "bp_both":
+# ── Render metric(s) ──────────────────────────────────────────────────────
+metric = st.session_state.metric_sel
+plot_df = plot_df = plot_df  # noop, keep name visible
+
+if metric == "bp_both":
     sbp = plot_df[plot_df["metric"]=="systolic_bp"].copy().sort_values("local_time")
     dbp = plot_df[plot_df["metric"]=="diastolic_bp"].copy().sort_values("local_time")
     if sbp.empty and dbp.empty:
@@ -516,8 +394,7 @@ if st.session_state.metric_sel == "bp_both":
             return {pd.to_datetime(t): float(v) if pd.notna(v) else None
                     for t,v in zip(df["local_time"], pd.to_numeric(df["value"], errors="coerce"))}
         m1, m2 = to_map(sbp), to_map(dbp)
-        y1 = [m1.get(ts, None) for ts in x]
-        y2 = [m2.get(ts, None) for ts in x]
+        y1 = [m1.get(ts, None) for ts in x]; y2 = [m2.get(ts, None) for ts in x]
         lsl1, usl1 = get_limits_for_mode(st.session_state.limit_mode, pid, "systolic_bp", sbp["value"])
         lsl2, usl2 = get_limits_for_mode(st.session_state.limit_mode, pid, "diastolic_bp", dbp["value"])
 
@@ -546,7 +423,6 @@ if st.session_state.metric_sel == "bp_both":
                 + f"<div><b>Latest</b> {latest2}</div></div>", unsafe_allow_html=True
             )
 else:
-    metric = st.session_state.metric_sel
     sub = plot_df[plot_df["metric"] == metric].copy().sort_values("local_time")
     if sub.empty:
         st.info("No data for this metric.")
@@ -576,20 +452,17 @@ else:
                 unsafe_allow_html=True
             )
 
-# ─────────────────────────────────────────────
-# BELOW THE CHART: Add Note / Add Meal (forms)
-# ─────────────────────────────────────────────
+# ── Add Note / Add Meal ───────────────────────────────────────────────────
 st.markdown("### Add Note & Add Meal")
 note_col, meal_col = st.columns([1, 2], gap="large")
 
 with note_col:
     st.subheader("📝 Add Note")
     with st.form("note_form", clear_on_submit=True):
-        note_text = st.text_input("Note", key="note_text_input", placeholder="e.g., felt dizzy after a walk")
-        use_now_note = st.checkbox("Use current time", value=False, key="use_now_note")
-        note_date = st.date_input("When? (date)", value=datetime.now().date(), disabled=use_now_note, key="note_date_input")
-        note_time = st.time_input("Time", value=datetime.now().time().replace(second=0, microsecond=0),
-                                  disabled=use_now_note, key="note_time_input")
+        note_text = st.text_input("Note", placeholder="e.g., felt dizzy after a walk")
+        use_now_note = st.checkbox("Use current time", value=False)
+        note_date = st.date_input("When? (date)", value=datetime.now().date(), disabled=use_now_note)
+        note_time = st.time_input("Time", value=datetime.now().time().replace(second=0, microsecond=0), disabled=use_now_note)
         submitted = st.form_submit_button("➕ Add Note")
     if submitted:
         if use_now_note:
@@ -609,12 +482,10 @@ with note_col:
 with meal_col:
     st.subheader("🍽️ Add Meal (USDA)")
     with st.form("usda_search_form"):
-        q = st.text_input("Search food (USDA)", placeholder="grilled chicken salad, oatmeal, …", key="usda_query_input")
+        q = st.text_input("Search food (USDA)", placeholder="grilled chicken salad, oatmeal, …")
         use_now_meal = st.checkbox("Use current time", value=False, key="use_now_meal")
-        mdate = st.date_input("When was it eaten? (date)", value=datetime.now().date(),
-                              disabled=use_now_meal, key="meal_date_input")
-        mtime = st.time_input("Time", value=datetime.now().time().replace(second=0, microsecond=0),
-                              disabled=use_now_meal, key="meal_time_input")
+        mdate = st.date_input("When was it eaten? (date)", value=datetime.now().date(), disabled=use_now_meal)
+        mtime = st.time_input("Time", value=datetime.now().time().replace(second=0, microsecond=0), disabled=use_now_meal)
         do_search = st.form_submit_button("🔎 Search")
     if do_search:
         hits = []
@@ -672,8 +543,7 @@ with meal_col:
                     if st.session_state.get("use_now_meal", False):
                         ts_utc = pd.Timestamp.now(tz=tz_choice).tz_convert("UTC")
                     else:
-                        local = pd.Timestamp.combine(st.session_state.get("meal_date_input"),
-                                                     st.session_state.get("meal_time_input")).tz_localize(tz_choice)
+                        local = pd.Timestamp.combine(mdate, mtime).tz_localize(tz_choice)
                         ts_utc = local.tz_convert("UTC")
                     new_row = {
                         "timestamp_utc": ts_utc, "food": title,
@@ -688,9 +558,7 @@ with meal_col:
                     st.success("Meal added.")
                     st.rerun()
 
-# ─────────────────────────────────────────────
-# Recent Meals breakdown (persistent)
-# ─────────────────────────────────────────────
+# ── Recent Meals list ─────────────────────────────────────────────────────
 st.markdown("### 🍽️ Recent Meals")
 if st.session_state["meals"].empty:
     st.info("No meals added yet.")

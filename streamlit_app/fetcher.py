@@ -2,6 +2,7 @@
 from __future__ import annotations
 import os, time
 from typing import Any, Dict, Optional, Iterable
+
 import pandas as pd
 import requests
 import streamlit as st
@@ -76,15 +77,27 @@ def fetch_patients() -> pd.DataFrame:
 
 @cache_fn(ttl=8)
 def fetch_data(*, hours: int = 24, patient_id: Optional[str] = None) -> pd.DataFrame:
+    """
+    Live data ONLY for patient_id == 'todd'.
+    Everyone else returns high-quality fake series so the UI is always full.
+    """
     params: Dict[str, Any] = {"hours": int(hours)}
     if patient_id:
         params["patient_id"] = str(patient_id)
-    data = _request_json("GET", "/vitals", params=params)
-    if isinstance(data, dict) and "items" in data and isinstance(data["items"], list):
-        data = data["items"]
+    pid = (patient_id or "").strip().lower()
+
+    if pid and pid != "todd":
+        data = _fake_response("vitals", params)
+    else:
+        data = _request_json("GET", "/vitals", params=params)
+        if isinstance(data, dict) and isinstance(data.get("items"), list):
+            data = data["items"]
+
     if not isinstance(data, list):
         data = []
     df = pd.DataFrame(data)
+
+    # normalize
     if "timestamp_utc" not in df.columns:
         for cand in ("ts", "timestamp", "time_utc", "created_at_utc"):
             if cand in df.columns:
@@ -113,16 +126,16 @@ def _fake_response(path: str, params: Dict[str, Any]) -> Any:
         now = datetime.now(timezone.utc)
         ts = [now - timedelta(minutes=15 * i) for i in range(hours * 4)]
         ts = list(reversed(ts))
-        hr = 72 + 8 * np.sin(np.linspace(0, 8, len(ts)))
-        spo2 = 97 + np.sin(np.linspace(0, 6, len(ts))) * 0.6
+        hr  = 72 + 8 * np.sin(np.linspace(0, 8, len(ts)))
+        spo2= 97 + np.sin(np.linspace(0, 6, len(ts))) * 0.6
         sbp = 120 + 10 * np.sin(np.linspace(0, 5, len(ts)))
-        dbp = 78 + 6 * np.cos(np.linspace(0, 5, len(ts)))
+        dbp = 78 + 6  * np.cos(np.linspace(0, 5, len(ts)))
         out = []
         for i, t in enumerate(ts):
             iso = t.isoformat()
-            out.append({"patient_id": pid, "timestamp_utc": iso, "metric": "pulse", "value": float(hr[i])})
-            out.append({"patient_id": pid, "timestamp_utc": iso, "metric": "spo2", "value": float(spo2[i])})
-            out.append({"patient_id": pid, "timestamp_utc": iso, "metric": "systolic_bp", "value": float(sbp[i])})
+            out.append({"patient_id": pid, "timestamp_utc": iso, "metric": "pulse",        "value": float(hr[i])})
+            out.append({"patient_id": pid, "timestamp_utc": iso, "metric": "spo2",         "value": float(spo2[i])})
+            out.append({"patient_id": pid, "timestamp_utc": iso, "metric": "systolic_bp",  "value": float(sbp[i])})
             out.append({"patient_id": pid, "timestamp_utc": iso, "metric": "diastolic_bp", "value": float(dbp[i])})
         return out
     return {"ok": False, "error": "unknown path in fake mode"}

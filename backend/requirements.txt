@@ -1,8 +1,5 @@
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
-sqlalchemy==2.0.36
-requests==2.32.3
-pandas==2.2.3
-numpy==2.1.2
-python-multipart==0.0.9
-psycopg[binary]
+pydantic==2.9.2
+SQLAlchemy==2.0.34
+psycopg2-binary==2.9.9
